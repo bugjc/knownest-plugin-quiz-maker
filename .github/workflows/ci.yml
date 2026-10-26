@@ -1,0 +1,16 @@
+name: ci
+on:
+  push:
+  pull_request:
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: 语法门（node --check）
+        run: find . -name '*.js' -not -path './.git/*' -print0 | xargs -0 -n1 node --check
+      - name: 清单与 i18n 门（必需字段 + en 完整性）
+        run: node .github/check-plugin.cjs

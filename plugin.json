@@ -1,39 +1,242 @@
 {
   "id": "quiz-maker",
-  "name": "做题生成器",
-  "version": "0.23.0",
-  "description": "内化阶段：出题官角色（LLM 深度出题，接地校验+盲答验证双闸门）+ 确定性热身挖空题 + 库存题画像匹配复用（v9-T4），并入题库立即开练",
+  "name": "练习",
+  "version": "0.42.0",
+  "description": "学习闭环（做题与复习）：内核级 9 工具（出题双写/补题/做题会话/复习调度/判分回流/学习统计/学习教练）+ 深度出题官 + 练习页。停用即学习工具面整体消失。",
   "entry": "index.js",
   "permissions": [
     "file:read",
     "db:read",
     "db:write",
-    "agent:tools"
+    "agent:tools",
+    "file:write"
   ],
-  "usage": "从知识库文档出题，帮你把看过的内容变成可检验的练习。\n怎么用（三选一）：\n1. 对小诺说：「根据《文档名》出 5 道题」「来一组填空题」——出题官按规范深度出题（每题过接地校验+盲答验证），生成后自动打开做题界面。\n2. Agent 面板「学习」Tab → 点「生成题目」按钮，直达。\n3. 做错/不确定的题会进入 SM-2 复习调度，「学习」Tab 的「今日复习」按期带你巩固；题库页可看每题掌握度与健康度（差评率/验证占比），已下架题可就地恢复。\n说明：「单选·热身」为确定性生成（不耗 LLM 费用）；深度题由出题官生成并双闸门质检。",
+  "usage": "$t{quiz-maker.usage}",
   "contributions": [
     {
       "point": "nav.entry",
       "key": "question-bank",
-      "action": "题库",
+      "action": "$t{quiz-maker.nav.question-bank}",
       "method": "pageQuestionBank",
-      "slot": "nav.sidebar"
+      "slot": "nav.sidebar",
+      "icon": "book",
+      "order": 2
     },
     {
       "point": "agent.preset",
       "key": "出题官",
       "action": "出题官",
       "routeHint": "出题/练习/测验/刷题/根据文档出题类请求委派给我：按出题规范深度出题（答案先行、三层题型、干扰项同概念域、逐字接地）",
-      "systemPrompt": "你是 Knomi 的出题官——把知识库内容变成可检验练习的专家。你的产出只有一种：能通过质量闸门的题目。\n\n【出题纪律（逐条强制）】\n1. 答案先行：每题先从材料中摘出唯一可考的要点作为答案，再针对该要点构造题干；禁止先写题干再凑答案。\n2. 接地：每题 sourceSnippet 必须逐字摘自材料原文（连续片段；禁止改写、拼接、概括）。落库时有接地校验，不符即拒收。\n3. 认知分层：题目覆盖 记忆（单选/判断）、理解（多选/填空）、应用（简答/排序）三层，默认 5 题按 2:2:1 配比；用户指定题量/题型时从其要求。每题必须自报 cognitiveLevel 字段（记忆/理解/应用 三选一）——健康度按层级度量分布，防止题库向「背知识点」漂移。\n4. 个性化：材料附带薄弱点信号时，针对薄弱知识点的题不少于 40%；新学材料（无作答记录）偏记忆层，复习材料偏理解与应用层。\n5. 干扰项：选择题干扰项必须来自同概念域或该知识点的常见误解，与正确答案长度相近；禁止明显荒谬项、同义重复项；正确答案位置随机分布，不集中在同一选项。\n6. 唯一性自检：提交前逐题自检——该题只能有一个合理答案；答案能且只能由 sourceSnippet 支撑；题干不含暗示。\n7. 挂接：每题尽量提供 knowledgePointTitle（优先使用材料给定的知识点锚点），让题目进入知识体系。\n\n【产出与落库】\n生成完成后立即调用 generate_questions 工具落库开练（generator 传「出题官」，入库进 SM-2 复习闭环，并开启做题会话）。绝不在聊天文本中复述题目原文、选项、答案或解析。被质量闸门拒收的题按拒收原因修正，至多补生成一轮。"
+      "systemPrompt": "你是 Knownest 的出题官——把知识库内容变成可检验练习的专家。你的产出只有一种：能通过质量闸门的题目。\n\n【出题纪律（逐条强制）】\n1. 答案先行：每题先从材料中摘出唯一可考的要点作为答案，再针对该要点构造题干；禁止先写题干再凑答案。\n2. 接地：每题 sourceSnippet 必须逐字摘自材料原文（连续片段；禁止改写、拼接、概括）。落库时有接地校验，不符即拒收。\n3. 认知分层：题目覆盖 记忆（单选/判断）、理解（多选/填空）、应用（简答/排序）三层，默认 5 题按 2:2:1 配比；用户指定题量/题型时从其要求。每题必须自报 cognitiveLevel 字段（记忆/理解/应用 三选一）——健康度按层级度量分布，防止题库向「背知识点」漂移。\n4. 个性化：材料附带薄弱点信号时，针对薄弱知识点的题不少于 40%；新学材料（无作答记录）偏记忆层，复习材料偏理解与应用层。\n5. 干扰项：选择题干扰项必须来自同概念域或该知识点的常见误解，与正确答案长度相近；禁止明显荒谬项、同义重复项；正确答案位置随机分布，不集中在同一选项。\n6. 唯一性自检：提交前逐题自检——该题只能有一个合理答案；答案能且只能由 sourceSnippet 支撑；题干不含暗示。\n7. 挂接：每题尽量提供 knowledgePointTitle（优先使用材料给定的知识点锚点），让题目进入知识体系。\n\n【产出与落库】\n生成完成后立即调用 generate_questions 工具落库开练（generator 传「出题官」，入库进 SM-2 复习闭环，并开启做题会话）。绝不在聊天文本中复述题目原文、选项、答案或解析。被质量闸门拒收的题按拒收原因修正，至多补生成一轮。\n\n【数据资产面】调用 list_data_assets 工具可查看知识库全部数据资产（含你维护的 quiz-maker/questions 与 quiz-maker/review-due）。回答「我有什么数据/数据从哪来/能做什么组合」类问题时先调它，引用资产全名与查询 method 作答。"
+    },
+    {
+      "point": "practice.generator",
+      "action": "$t{quiz-maker.contrib.practice-generator}"
     }
   ],
   "configSchema": [
     {
       "key": "practice_objective_first",
-      "label": "复习先客观题",
+      "label": "$t{quiz-maker.config.practice_objective_first}",
       "type": "boolean",
       "default": false,
-      "description": "开启后「开始做题/今日复习」的到期队列把客观题（单选/多选/判断）排在主观题前面，降低简答打头的挫败感"
+      "description": "$t{quiz-maker.config.practice_objective_first.desc}"
+    }
+  ],
+  "provides": {
+    "data": [
+      {
+        "id": "questions",
+        "title": "题目主数据",
+        "description": "quiz-maker 维护的题目全量主数据（SM-2 闭环源）；读门=listQuestions，写门=insertQuestion/retireQuestion/flagQuestionFeedback/purgeRetiredQuestionFeedback（P3 起非属主题目写面唯一通道，consumes 声明即授权）",
+        "schema": "行字段: id, question, type, documentId, knowledgePointId, status",
+        "method": "listQuestions",
+        "queryParams": [
+          "filter?",
+          "limit?"
+        ],
+        "version": 1,
+        "sample": {
+          "id": "q_sm2_example01",
+          "question": "什么是 SM-2 复习算法的间隔计算依据？",
+          "type": "qa",
+          "documentId": "doc_example",
+          "knowledgePointId": "kp_example",
+          "status": "confirmed"
+        },
+        "fields": [
+          {
+            "name": "id",
+            "type": "id",
+            "desc": "题目唯一标识（作答/复习引用它）"
+          },
+          {
+            "name": "question",
+            "type": "string",
+            "desc": "题面文本"
+          },
+          {
+            "name": "type",
+            "type": "enum",
+            "desc": "题型：single_choice/multi_choice/true_false/qa/blank"
+          },
+          {
+            "name": "documentId",
+            "type": "id",
+            "desc": "来源文档（可空=无锚定文档）"
+          },
+          {
+            "name": "knowledgePointId",
+            "type": "id",
+            "desc": "挂载知识点（可空）"
+          },
+          {
+            "name": "status",
+            "type": "enum",
+            "desc": "confirmed 在库 / retired 已退回"
+          }
+        ]
+      },
+      {
+        "id": "review-due",
+        "title": "复习到期队列",
+        "description": "SM-2 到期待复习题目（next_review_at 到期口径，含 NULL=立即到期）",
+        "schema": "行字段: 同 questions + lastAttemptAt, attemptCount",
+        "method": "listDueQuestions",
+        "queryParams": [
+          "limit?"
+        ],
+        "version": 1,
+        "fields": [
+          {
+            "name": "id",
+            "type": "id",
+            "desc": "题目唯一标识"
+          },
+          {
+            "name": "question",
+            "type": "string",
+            "desc": "题面文本"
+          },
+          {
+            "name": "type",
+            "type": "enum",
+            "desc": "题型：single_choice/multi_choice/true_false/qa/blank"
+          },
+          {
+            "name": "lastAttemptAt",
+            "type": "date",
+            "desc": "最近一次作答时刻（可缺）"
+          },
+          {
+            "name": "attemptCount",
+            "type": "number",
+            "desc": "累计作答次数"
+          }
+        ]
+      },
+      {
+        "id": "stats",
+        "title": "学习统计聚合",
+        "description": "学习口径单一实现（22 节化取数：summary/dueBreakdown/weakDocs/streak/docStats/attemptsByDay/firstTaggedDay/dueFroms/docAccuracy/byGenerator/bankQuality/dueHistogram/wrongAttempts/attempts/clearedCount/docMistakes/gateStats/uncoveredKps/weakKps/effectRows/weakDomains/kpQuestionCount，args.sections 声明所需）",
+        "schema": "对象: { generatedAt, <各节>, 节失败置空 }",
+        "method": "getStudyStats",
+        "queryParams": [
+          "sections?[]",
+          "repoId?",
+          "weakLimit?",
+          "docFilter?",
+          "docAccuracyLimit?",
+          "wrongLimit?",
+          "documentIds?[]",
+          "documentId?",
+          "type?",
+          "kpIds?[]"
+        ],
+        "version": 1
+      },
+      {
+        "id": "profile-contribution",
+        "title": "画像贡献",
+        "description": "学习者画像活动/薄弱分量贡献（D6 反转 P2 贡献机制 v1）：按域输出近 7/30 天作答次数与薄弱知识点数，domain 对齐 taxonomy_semantics.domain；内核 LearnerProfileService 经资产目录识别本资产并聚合",
+        "schema": "行: { domain, attempts7d, attempts30d, weakCount }",
+        "method": "getProfileContribution",
+        "queryParams": [],
+        "version": 1,
+        "profileContribution": true
+      }
+    ]
+  },
+  "agentTools": [
+    {
+      "name": "generate_questions"
+    },
+    {
+      "name": "expand_question_bank"
+    },
+    {
+      "name": "focus_object"
+    },
+    {
+      "name": "start_practice_session"
+    },
+    {
+      "name": "get_due_questions"
+    },
+    {
+      "name": "submit_question_answer"
+    },
+    {
+      "name": "report_question"
+    },
+    {
+      "name": "get_learning_stats"
+    },
+    {
+      "name": "study_coach"
+    },
+    {
+      "name": "generate_quiz"
+    }
+  ],
+  "i18n": {
+    "zh-CN": {
+      "quiz-maker.nav.question-bank": "练习",
+      "quiz-maker.contrib.practice-generator": "生成题目",
+      "quiz-maker.config.practice_objective_first": "复习先客观题",
+      "quiz-maker.config.practice_objective_first.desc": "开启后「开始做题/今日复习」的到期队列把客观题（单选/多选/判断）排在主观题前面，降低简答打头的挫败感",
+      "quiz-maker.usage": "**能干什么**：从知识库文档出题，帮你把看过的内容变成可检验的练习。\n\n**怎么用**（三选一）：\n1. 对白泽说：「根据《文档名》出 5 道题」「来一组填空题」——出题官按规范深度出题（每题过接地校验+盲答验证），生成后自动打开做题界面；\n2. Agent 面板「学习」Tab → 点「生成题目」按钮，直达；\n3. 做错/不确定的题会进入 SM-2 复习调度，「学习」Tab 的「今日复习」按期带你巩固；练习页可看每题掌握度与健康度（差评率/验证占比），已下架题可就地恢复。\n\n**说明**：「单选·热身」为确定性生成（不耗 LLM 费用）；深度题由出题官生成并双闸门质检。",
+      "quiz-maker.display-name": "练习",
+      "quiz-maker.preset.quiz-master": "出题官"
+    },
+    "en-US": {
+      "quiz-maker.nav.question-bank": "Practice",
+      "quiz-maker.contrib.practice-generator": "Generate questions",
+      "quiz-maker.config.practice_objective_first": "Objective questions first in review",
+      "quiz-maker.config.practice_objective_first.desc": "When enabled, the due queue of \"Start practice / Today's review\" puts objective questions (single/multiple choice, true-false) before subjective ones, reducing the frustration of open answers leading the session",
+      "quiz-maker.usage": "**What it does**: generates questions from knowledge-base documents, turning what you've read into checkable practice.\n\n**How to use** (pick any of three):\n1. Tell Baize: \"Make 5 questions from 'Document name'\", \"Give me a set of fill-in-the-blanks\" — the question officer writes to spec and in depth (every question passes grounding checks + blind-answer validation); the practice view opens automatically when done;\n2. Agent panel \"Study\" tab → click \"Generate questions\" to go straight there;\n3. Wrong or unsure questions enter SM-2 review scheduling; \"Today's review\" on the Study tab walks you through them on schedule; the practice page shows per-question mastery and health (down-vote rate / validation share); retired questions can be restored in place.\n\n**Notes**: \"Single choice · warm-up\" is generated deterministically (no LLM cost); in-depth questions are written by the question officer and pass a double quality gate.",
+      "quiz-maker.display-name": "Practice",
+      "quiz-maker.preset.quiz-master": "Quiz Master",
+      "练习": "Practice",
+      "出题官": "Quiz Master",
+      "复习先客观题": "Objective questions first in review",
+      "开启后「开始做题/今日复习」的到期队列把客观题（单选/多选/判断）排在主观题前面，降低简答打头的挫败感": "When enabled, the due queue of \"Start practice / Today's review\" puts objective questions (single/multiple choice, true-false) before subjective ones, reducing the frustration of open answers leading the session",
+      "练习": "Practice",
+      "**能干什么**：从知识库文档出题，帮你把看过的内容变成可检验的练习。\n\n**怎么用**（三选一）：\n1. 对白泽说：「根据《文档名》出 5 道题」「来一组填空题」——出题官按规范深度出题（每题过接地校验+盲答验证），生成后自动打开做题界面；\n2. Agent 面板「学习」Tab → 点「生成题目」按钮，直达；\n3. 做错/不确定的题会进入 SM-2 复习调度，「学习」Tab 的「今日复习」按期带你巩固；练习页可看每题掌握度与健康度（差评率/验证占比），已下架题可就地恢复。\n\n**说明**：「单选·热身」为确定性生成（不耗 LLM 费用）；深度题由出题官生成并双闸门质检。": "**What it does**: generates questions from knowledge-base documents, turning what you've read into checkable practice.\n\n**How to use** (pick any of three):\n1. Tell Baize: \"Make 5 questions from 'Document name'\", \"Give me a set of fill-in-the-blanks\" — the question officer writes to spec and in depth (every question passes grounding checks + blind-answer validation); the practice view opens automatically when done;\n2. Agent panel \"Study\" tab → click \"Generate questions\" to go straight there;\n3. Wrong or unsure questions enter SM-2 review scheduling; \"Today's review\" on the Study tab walks you through them on schedule; the practice page shows per-question mastery and health (down-vote rate / validation share); retired questions can be restored in place.\n\n**Notes**: \"Single choice · warm-up\" is generated deterministically (no LLM cost); in-depth questions are written by the question officer and pass a double quality gate.",
+      "学习闭环（做题与复习）：内核级 9 工具（出题双写/补题/做题会话/复习调度/判分回流/学习统计/学习教练）+ 深度出题官 + 练习页。停用即学习工具面整体消失。": "Learning loop (practice & review): 9 kernel-level tools (dual-write question generation / make-up questions / practice sessions / review scheduling / scoring write-back / study stats / study coach) + the Deep Question Officer + the practice page. Deactivating it removes the whole learning-tools surface."
+    }
+  },
+  "category": "出题练习",
+  "tags": [
+    "出题",
+    "刷题",
+    "练习"
+  ],
+  "agentGuidance": "学习闭环纪律：①出题先读原文（read_document/search_docs），每题 sourceSnippet 必须逐字摘自原文；②绝不在聊天文本中复述题目原文/选项/答案——练习一律经做题界面（判分与 SM-2 调度在那条链路）；③用户说\"开始做题/今日复习\"用 start_practice_session，\"补题/覆盖薄弱知识点\"用 expand_question_bank；④题目尽量用 knowledgePointTitle 挂接知识体系。",
+  "consumes": [
+    {
+      "asset": "study-coach/rhythm-config",
+      "optional": true
     }
   ]
 }

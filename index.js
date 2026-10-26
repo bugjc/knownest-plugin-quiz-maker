@@ -4,7 +4,7 @@
  * quiz-maker 内化阶段插件（v0.2）
  *
  * 核心：generate_cloze_quiz —— 从文档确定性生成"选择填空"题（零 LLM 依赖）：
- *   句子切分 → 关键术语识别 → 挖空 → 干扰项取自全文术语 → 闸1 质检（不入库直接开练）
+ *   句子切分 → 关键术语识别 → 挖空 → 干扰项取自全文术语 → 闸1 质检（通过即入库开练）
  *   → 返回 start_practice 意图，内容区立即进入做题模式。
  * 每题强制 sourceSnippet（原文句子），入库经 ADR-102 校验（answer/去重），
  * 失败计入 rejected 并如实汇报——绝不产生占位题。
@@ -17,17 +17,29 @@
 const PLUGIN_ID = 'quiz-maker'
 
 // 接地/质量闸：平台共享纯函数库注入（B1' T1-2，唯一权威实现在 electron/shared/plugin-stdlib，
-// 经沙箱 knomi.stdlib 只读命名空间下发 + sha256 对账）。偏斜守卫：缺面（旧平台+新插件窗口）
+// 经沙箱 knownest.stdlib 只读命名空间下发 + sha256 对账）。偏斜守卫：缺面（旧平台+新插件窗口）
 // 时预检放行不阻断出题，宿主终检兜底；注入恢复后预检自动回归。禁止再持本地副本。
-const std = (typeof knomi !== 'undefined' && knomi.stdlib) || null
+const std = (typeof knownest !== 'undefined' && knownest.stdlib) || null
 const isGroundedIn = (std && std.grounding && std.grounding.isGroundedIn) || (() => true)
 const qcQuestionBatch = (std && std.qc && std.qc.qcQuestionBatch) || ((list) => ({ passed: list, rejected: [] }))
 const normalizeForQc = (std && std.qc && std.qc.normalizeForQc)
   || ((t) => { const m = String(t || '').toLowerCase().match(/[\p{L}\p{N}]/gu); return m ? m.join('') : '' })
+// 学习闭环工具（2026-10-11 自 baize 内核迁入：工具所有者=quiz-maker，停用即学习工具面消失）
+const { registerPracticeTools } = require('./tools/practice-tools')
+const { registerLearningTools } = require('./tools/learning-tools')
+const { registerLearningCoachTools } = require('./tools/study-coach-tools')
 const { matchInventoryQuestions } = require('./lib/match')
+const caliber = require('./lib/learning-caliber')
+// 题目导入解析器（2026-10-03 计划 B0：JSON/Anki TSV/CSV → 归一化题目 + 逐行错误 + 承载文档底稿）
+const parsers = require('./lib/import-parsers')
+// 题目店自持写层（B1 片 2：宿主属主 ctx 单点退役，全部自店写经本层 ctx.store 落地）
+const qstore = require('./lib/question-store')
 
 /** 模块级上下文：nav.entry 页数据方法（plugin:invoke 直调）运行于 activate 作用域外 */
 let moduleCtx = null
+
+/** 导入会话 stash（importBank 解析 → 预览确认 confirmBankImport 两跳间承载；插件重载即失效，确认时如实报错引导重选） */
+const importSessions = new Map()
 
 /** CJK 词元与英文单词提取 */
 function extractTerms(text) {
@@ -102,8 +114,11 @@ function localDateStr(d = new Date()) {
 /** 即时挖空出题（P2 核心引擎）：文档确定性挖空 → 闸1 质检 → 入库立即开练。
  *  2026-09-25 题库回流恢复（用户决策：练习复习是学习闭环核心）：题目经 insertQuestion 并入
  *  题库累积 SM-2 调度（重复题去重复用库内 id），作答双轨记账（question_attempts 题库轨 +
- *  practice_attempts 文档轨）。被 knomi-agent practice-tools 与本插件工具链消费 */
+ *  practice_attempts 文档轨）。被 baize practice-tools 与本插件工具链消费 */
 async function practiceInstant(args = {}) {
+  // 标量归一（v0.24.3）：声明式 capability 行动作（学习报告「去练」）按行传参为字符串
+  // documentId——与既有对象形态 {documentId|documentPath|count} 并存，两口径同语义
+  if (typeof args === 'string') args = { documentId: args }
   const count = Math.min(Math.max(Number(args.count) || 5, 1), 15)
   const docs = (await moduleCtx.getDocuments()) || []
   if (!docs.length) return { output: '', error: '知识库为空，请先投递碎片或添加文档' }
@@ -133,7 +148,7 @@ async function practiceInstant(args = {}) {
               q.type, q.question, q.options_json AS optionsJson, q.answer, q.explanation,
               q.source_snippet AS sourceSnippet, q.plugin_id AS pluginId, q.generator, q.verified,
               s.profile_json AS profileJson, s.keywords_json AS keywordsJson
-       FROM questions q
+       FROM quiz_maker_questions q
        LEFT JOIN documents d ON d.id = q.document_id
        LEFT JOIN taxonomy_semantics s ON s.doc_id = q.document_id
          AND s.annotation_version = (SELECT MAX(annotation_version) FROM taxonomy_semantics)
@@ -196,8 +211,8 @@ async function practiceInstant(args = {}) {
   let badQKeys = new Set()
   try {
     const badRows = (await moduleCtx.query(
-      `SELECT a.question_snapshot AS snap FROM question_feedback f
-       JOIN practice_attempts a ON a.id = f.attempt_id
+      `SELECT a.question_snapshot AS snap FROM quiz_maker_question_feedback f
+       JOIN quiz_maker_practice_attempts a ON a.id = f.attempt_id
        WHERE f.document_id = ? AND f.kind != 'good_question' AND a.question_snapshot IS NOT NULL`,
       [doc.id]
     )) || []
@@ -233,7 +248,7 @@ async function practiceInstant(args = {}) {
   for (const r of qcRejected) rejected.push(`${r.question.slice(0, 16)}…（${r.reasons[0]}）`)
 
   if (remain > 0 && passed.length === 0 && reuseCount === 0) {
-    return { output: '', error: `未能从《${doc.title}》即时出题（扫描 ${sentences.length} 句，全部被拒: ${[...new Set(rejected)].slice(0, 3).join('；')}）` }
+    return { output: '', error: `《${doc.title}》暂无法即时出题：文档内容偏清单/过短，暂无满足条件的句子（已扫描 ${sentences.length} 句）` }
   }
 
   // 入库（2026-09-25 题库回流恢复）：每题经 insertQuestion 落题库（ADR-102 同文档去重），
@@ -244,7 +259,7 @@ async function practiceInstant(args = {}) {
   for (const q of passed) {
     let result = null
     try {
-      result = await moduleCtx.insertQuestion({
+      result = await qstore.insertQuestion(moduleCtx, {
         documentId: doc.id,
         type: q.type,
         question: q.question,
@@ -265,7 +280,7 @@ async function practiceInstant(args = {}) {
   }
   // 复用已满（reuseCount>0）时零生成是正常路径，不报错——库存题直接开练
   if (banked.length === 0 && reuseCount === 0) {
-    return { output: '', error: `未能从《${doc.title}》出题入库（${sentences.length} 句扫描，入库全部失败）` }
+    return { output: '', error: `《${doc.title}》出题未能入库（${sentences.length} 句扫描，入库全部失败）` }
   }
 
   const questions = [
@@ -351,14 +366,17 @@ function filterRepoNameOf(arg) {
 async function pageQuestionBank(filterArg) {
   // 守卫：moduleCtx 在 activate 时注入；冷激活重拉的首个调用若早于 activate 完成会拿到 null——
   // 返回可重试的业务错误而非崩溃（2026-09-19 插件页偶发报错防御）
-  if (!moduleCtx) return { error: '做题生成器正在激活，请稍后刷新重试' }
+  if (!moduleCtx) return { error: '练习正在激活，请稍后刷新重试' }
   let repos = []
   try { repos = (await moduleCtx.listRepositories()) || [] } catch { repos = [] }
   const wantedRepo = filterRepoNameOf(filterArg)
   const wantedType = (filterArg && typeof filterArg === 'object') ? String(filterArg.type || '').trim() : ''
   const wantedStatus = (filterArg && typeof filterArg === 'object') ? String(filterArg.status || '').trim() : ''
   const scopedRepo = wantedRepo ? repos.find((r) => r.name === wantedRepo) : null
-  const all = (await moduleCtx.getQuestions({ limit: 500, repoId: scopedRepo ? scopedRepo.id : undefined })) || []
+  // 缺包边界（B1 片 2）：自店表缺失（迁移未完成/未安装态）时显式引导，不裸抛 sqlite 错
+  const missing = await qstore.storeMissingNotice(moduleCtx)
+  if (missing) return { error: missing }
+  const all = (await caliber.getQuestions(moduleCtx.query, { limit: 500, repoId: scopedRepo ? scopedRepo.id : undefined })) || []
   // 题型/状态筛选（客户端，窗口内）：状态 '' = 全部，confirmed 反义排除 retired（兼容历史状态值）
   const filtered = all.filter((q) =>
     (!wantedType || q.type === wantedType) &&
@@ -374,20 +392,22 @@ async function pageQuestionBank(filterArg) {
   let total = all.length
   let dueTotal = windowDue
   try {
+    // 题库数原子口径（口径统一批 D10：未下架题数，scope 同式）——
+    // B1 片 2 起自店读（ctx.query COUNT），宿主属主方法随属主块退役
+    total = Number(await qstore.getBankCount(moduleCtx, scopedRepo ? scopedRepo.id : undefined)) || 0
+  } catch { /* 保持窗口计数 */ }
+  try {
+    // 题级到期数（题库轨 questions 自身调度列）：「今日复习」开练动作输入口径，保留全表 COUNT 不随 500 窗口低估
     const scopeWhere = scopedRepo
       ? `WHERE (document_id IN (SELECT id FROM documents WHERE repo_id = ?) OR repo_id = ?)`
       : ''
     const scopeParams = scopedRepo ? [scopedRepo.id, scopedRepo.id] : []
     const rows = (await moduleCtx.query(
-      `SELECT COUNT(*) AS total,
-              SUM(CASE WHEN status != 'retired' AND next_review_at IS NOT NULL AND next_review_at != '' AND next_review_at <= ? THEN 1 ELSE 0 END) AS due
-       FROM questions ${scopeWhere}`,
+      `SELECT SUM(CASE WHEN status != 'retired' AND next_review_at IS NOT NULL AND next_review_at != '' AND next_review_at <= ? THEN 1 ELSE 0 END) AS due
+       FROM quiz_maker_questions ${scopeWhere}`,
       [new Date().toISOString(), ...scopeParams]
     )) || []
-    if (rows[0]) {
-      total = Number(rows[0].total) || 0
-      dueTotal = Number(rows[0].due) || 0
-    }
+    if (rows[0] && rows[0].due != null) dueTotal = Number(rows[0].due) || 0
   } catch { /* 保持窗口计数 */ }
   const rows = filtered.map((q) => {
     const doc = docById.get(q.documentId)
@@ -406,10 +426,11 @@ async function pageQuestionBank(filterArg) {
     }
   })
   // 题库健康度（北极星，2026-09-18 出题质量迭代）：差评率/验证占比/近 7·30 天新题正确率。
+  // D2（2026-10-03 计划 v1.1）：拆两行——基础三组（质量面）+ 效果三组（学习效果面），指标一个不砍。
   // 拉取失败不阻塞页面（summary 缺省，表格照常渲染）
-  const summary = await (async () => {
+  const healthLine = await (async () => {
     try {
-      const h = await moduleCtx.getQuestionBankHealth(scopedRepo ? scopedRepo.id : undefined)
+      const h = await caliber.getQuestionBankHealth(moduleCtx.query, scopedRepo ? scopedRepo.id : undefined)
       if (!h || !h.total) return ''
       const fmtRate = (v) => (v === null || v === undefined ? '—' : `${v}%`)
       const recentTxt = (h.recent || [])
@@ -420,24 +441,41 @@ async function pageQuestionBank(filterArg) {
       const repair = eff.weakRepairRate != null ? `${eff.weakRepairRate}%（弱 ${eff.weakTotal}）` : '—（无薄弱 KP）'
       const ret7 = (eff.retention || []).find((r) => r.rate != null && r.pairs > 0) // 首个非空桶（数据常集中近期）
       const distTxt = `记忆 ${dist.memory || 0}/理解 ${dist.understanding || 0}/应用 ${dist.application || 0}${dist.untagged ? `/未标 ${dist.untagged}` : ''}`
-      return `题库健康度：差评率 ${fmtRate(h.feedbackRate)} · 已验证 ${fmtRate(h.verifiedRate)} · 新题正确率 ${recentTxt} · 薄弱修复信号 ${repair}${ret7 && ret7.rate != null ? ` · 间隔保持（${ret7.bucket}）${ret7.rate}%` : ''} · 层级分布 ${distTxt}`
+      const base = `题库健康度：差评率 ${fmtRate(h.feedbackRate)} · 已验证 ${fmtRate(h.verifiedRate)} · 新题正确率 ${recentTxt}`
+      const effect = `效果信号：薄弱修复 ${repair}${ret7 && ret7.rate != null ? ` · 间隔保持（${ret7.bucket}）${ret7.rate}%` : ''} · 层级分布 ${distTxt}`
+      return `${base}\n${effect}`
     } catch {
       return ''
     }
   })()
+  // 空态双路径引导（§3.3）：空态是新考试用户的第一触点，导入与 AI 出题两条能力都要在这露出
+  const summary = total === 0
+    ? '题库还是空的，两条路起步：①把现成题目（Anki 导出的 TSV / CSV / Excel）从「导入题库」收编进来；②把学习材料存入仓库，让 AI 从文档出题。'
+    : healthLine
+  // 「清空已下架」条件动作的全局计数（确认文案披露用；仅下架筛选视图查询）
+  let retiredTotal = 0
+  if (wantedStatus === 'retired') {
+    try {
+      const countRows = (await moduleCtx.query(`SELECT COUNT(*) AS n FROM quiz_maker_questions WHERE status = 'retired'`, [])) || []
+      retiredTotal = Number(countRows[0] && countRows[0].n) || 0
+    } catch { retiredTotal = 0 }
+  }
   return {
     title: `题库 · 共 ${total} 题` + (total > all.length ? `（显示最新 ${all.length}）` : '') + (scopedRepo ? ` · ${scopedRepo.name}` : '') + ((wantedType || wantedStatus) ? ` · 筛选 ${rows.length} 题` : ''),
     summary,
-    // 状态色标（columns[].tones 契约，2026-09-26）：状态/掌握度/到期一眼可辨
+    // 状态色标（columns[].tones 契约，2026-09-26）：状态/掌握度/到期一眼可辨；
+    // sortable/sortValues（v2.9 表格排序契约 2026-10-01）：列可点表头排序，enum 按声明值序；
+    // 默认序保持 SQL created_at DESC（不声明 orderBy）
     columns: [
-      { key: 'question', label: '题目' },
-      { key: 'type', label: '类型', width: 90 },
-      { key: 'source', label: '来源', width: 150, ellipsis: true },
-      { key: 'mastery', label: '掌握度', width: 90, tones: { 精通: 'geekblue', 已掌握: 'green', 学习中: 'orange' } },
-      { key: 'due', label: '到期', width: 70, tones: { 是: 'volcano' } },
-      { key: 'status', label: '状态', width: 80, tones: { 在库: 'green', 已下架: 'red' } },
+      { key: 'question', label: '题目', sortable: 'text' },
+      { key: 'type', label: '类型', width: 90, sortable: 'text' },
+      { key: 'source', label: '来源', width: 150, ellipsis: true, sortable: 'text' },
+      { key: 'mastery', label: '掌握度', width: 90, sortable: 'enum', sortValues: ['精通', '已掌握', '学习中', '未作答', '已下架'], tones: { 精通: 'geekblue', 已掌握: 'green', 学习中: 'orange' } },
+      { key: 'due', label: '到期', width: 70, sortable: 'enum', sortValues: ['是', '否'], tones: { 是: 'volcano' } },
+      { key: 'status', label: '状态', width: 80, sortable: 'enum', sortValues: ['在库', '已下架'], tones: { 在库: 'green', 已下架: 'red' } },
     ],
     rows,
+    rowKeyField: 'id',
     // 多筛选器（payload.filters 契约，2026-09-26）：仓库（SQL 作用域）+ 题型/状态（客户端过滤），
     // 切换任一下拉即以 { repo, type, status } 对象重拉本方法
     filters: [
@@ -458,7 +496,7 @@ async function pageQuestionBank(filterArg) {
     })(),
     // 行点击单题开练（rowClick 契约）：点击题为首题，后续按 SM-2 调度序连练到期题（就地做题）
     rowClick: { method: 'practiceQuestion', paramKey: 'id' },
-    // 行级动作（rowActions 数组契约 v8.1-T5）：在库行「来源」跳知识导航叶 +「下架」退出复习调度；
+    // 行级动作（rowActions 数组契约 v8.1-T5）：在库行「来源」预览态直达来源文档 +「下架」退出复习调度；
     // 已下架行「恢复」重新入库
     rowActions: [
       { label: '来源', method: 'locateSourceDoc', paramKey: 'id', when: { key: 'status', value: '在库' } },
@@ -476,7 +514,7 @@ async function pageQuestionBank(filterArg) {
                   COUNT(a.id) AS attempts,
                   SUM(CASE WHEN a.correct = 1 THEN 1 ELSE 0 END) AS correct,
                   COUNT(CASE WHEN a.correct IS NOT NULL THEN 1 END) AS graded
-           FROM questions q LEFT JOIN question_attempts a ON a.question_id = q.id
+           FROM quiz_maker_questions q LEFT JOIN quiz_maker_question_attempts a ON a.question_id = q.id
            ${scopeWhere} GROUP BY q.id`,
           scopeParams
         )) || []
@@ -492,43 +530,56 @@ async function pageQuestionBank(filterArg) {
       } catch { return undefined }
     })(),
     // 次动作区（学习 Tab 退役迁移：导出/导入/出题指令，secondaryActions 契约 2026-09-20）；
-    // 清空已下架（2026-09-26 用户反馈）为破坏性动作——confirm 声明由 PackPage Popconfirm 闸门先行
+    // 清空已下架（2026-09-26 用户反馈）为破坏性动作——confirm 声明由 PackPage Popconfirm 闸门先行；
+    // 导出所选题目（P0-1，2026-10-02）：intent 声明走平台意图（Deck 携带表格勾选的题目 id →
+    // 平台分享 Modal 题目模式→share-service questionIds 优先导出），插件不经手导出通道
     secondaryActions: [
-      { label: `题型偏好：${(await (async () => { try { return Boolean((await moduleCtx.getConfig()).practice_objective_first) } catch { return false } })()) ? '先客观题' : '全部题型'}`, method: 'toggleObjectiveFirst' },
-      { label: '清空已下架', method: 'pagePurgeRetired', confirm: '将永久删除全部已下架题目（作答历史保留），不可恢复。确定清空？' },
-      { label: '导出 JSON', method: 'exportBankJson' },
-      { label: '导出 Anki', method: 'exportBankAnki' },
-      { label: '导入题库', method: 'importBank', kind: 'file', accept: '.json' },
-      { label: '复制出题指令', method: 'pageGeneratePrompt' },
-      { label: '一键补题', method: 'pageExpandHandoff' },
+      // 收敛（2026-10-03 计划 §3.3：常态 9→4）：题型偏好纯退役（设置页 configSchema「复习先客观题」已承载，
+      // 且实为做题队列排序偏好与出题无关）；导出三合一（有勾选 Deck 携 selection 走 share.export 意图，
+      // 无勾选 Deck 回退 method → 平台导出 Modal 二选一格式）；补题两合一（handoff 直达 + 指令随剪贴板）
+      { label: '导入题库', method: 'importBank', kind: 'file', accept: '.json,.txt,.csv,.tsv,.xlsx,.xls' },
+      { label: '导出', method: 'exportBankChoose', intent: 'share.export' },
+      { label: 'Agent 补题', method: 'pageAgentSupplement' },
       { label: '错题归因', method: 'pageMistakeAttribution' },
+      // 条件出现（§3.3）：仅「已下架」筛选视图渲染，破坏性动作与作用对象同屏；确认文案带全局计数+跨仓
+      // 明示——pagePurgeRetired 现为全局无参清空，防「所见即所删」预期违背（v1.1 评审 P1-4）
+      ...(wantedStatus === 'retired' ? [{
+        label: '清空已下架',
+        method: 'pagePurgeRetired',
+        confirm: `将永久删除全部已下架题目（全库共 ${retiredTotal} 道，含其他仓库，作答历史保留），不可恢复。确定清空？`,
+      }] : []),
     ],
+    // 行勾选（Deck selection 契约 v2.10）：勾选集随上方「导出所选题目」intent 动作分发
+    selection: true,
   }
 }
 
-/** nav.entry 行级动作（rowActions 契约 v8.1-T5 反馈⑤）：题目来源文档 → 知识导航叶深链。
- *  ui 意图 navigate（goRoute）→ /navigator?node=<来源文档标题>——题目出自哪个文档一眼可见 */
+/** nav.entry 行级动作（rowActions 契约 v8.1-T5 反馈⑤）：题目来源文档 → 预览态直达。
+ *  ui 意图 focus_object（doc 目的地）+ mode=preview → 编辑器预览打开来源文档——
+ *  2026-10-09 用户反馈：来源=核对型动作（看一眼回溯上下文），直接预览而非落入编辑态
+ *  （FR-168 阅读意图默认预览口径，与图谱节点/收件箱打开同款）；回程浮条返回题库页。
+ *  原知识导航页 /navigator 退役（2026-09-28），本动作即题库来源唯一出口 */
 async function locateSourceDoc(questionId) {
-  if (!moduleCtx) return { error: '做题生成器未激活' }
-  const all = (await moduleCtx.getQuestions({})) || []
+  if (!moduleCtx) return { error: '练习未激活' }
+  const all = (await caliber.getQuestions(moduleCtx.query, {})) || []
   const q = all.find((x) => x.id === questionId)
   if (!q) return { error: `未找到题目: ${questionId}` }
   if (!q.documentId) return { error: '该题无来源文档（即时题请在做题界面看原文）' }
   const docs = (await moduleCtx.getDocuments()) || []
   const doc = docs.find((d) => d.id === q.documentId)
-  const title = String(doc?.title || '').trim()
-  if (!title) return { error: '来源文档不存在或已删除' }
-  return { ui: { intent: 'navigate', path: `/navigator?node=${encodeURIComponent(title)}` } }
+  const docPath = doc && (doc.filePath || doc.file_path)
+  if (!docPath) return { error: '来源文档不存在或已删除' }
+  return { ui: { intent: 'focus_object', objectType: 'doc', objectId: docPath, label: doc.title, mode: 'preview' } }
 }
 
 /** 错题归因页（v8.1-T5 反馈⑥）：correct=0 作答 → 来源文档标引词/概念确定性匹配 → 按概念分组。
  *  主信号=来源文档标引词（强信号，题干 LIKE 误中率高仅作补充）；未匹配错题单列（诚实披露）。
  *  数据全部只读（practice_attempts 自包含快照 + taxonomy_semantics 标引词），零 LLM 成本 */
 async function pageMistakeAttribution() {
-  if (!moduleCtx) return { error: '做题生成器未激活' }
+  if (!moduleCtx) return { error: '练习未激活' }
   const wrong = (await moduleCtx.query(
     `SELECT document_id AS documentId, question_snapshot AS snapshot, COUNT(*) AS n
-     FROM practice_attempts WHERE correct = 0
+     FROM quiz_maker_practice_attempts WHERE correct = 0
      GROUP BY document_id, question_snapshot ORDER BY n DESC LIMIT 500`
   )) || []
   if (wrong.length === 0) return { title: '错题归因', columns: [{ key: 'concept', label: '概念' }, { key: 'n', label: '错题数' }], rows: [], message: '暂无错题记录——保持住！' }
@@ -539,7 +590,7 @@ async function pageMistakeAttribution() {
      WHERE s.annotation_version >= 6 AND s.doc_id IN (${docIds.map(() => '?').join(',')})`,
     docIds
   )) || []
-  const kwByDoc = new Map(kwRows.map((r) => [r.docId, (() => { try { return JSON.parse(r.keywords_json || '{}') } catch { return {} } })()]))
+  const kwByDoc = new Map(kwRows.map((r) => [r.docId, (() => { try { return JSON.parse(r.keywordsJson || r.keywords_json || '{}') } catch { return {} } })()]))
   const norm = (x) => String(x || '').trim().toLowerCase().replace(/s+/g, '')
   // 概念分组（确定性）：错题文档标引词（领域/主题/技术/标签）为分组键
   const groups = new Map()
@@ -564,71 +615,85 @@ async function pageMistakeAttribution() {
   return {
     title: `错题归因 · ${wrong.length} 组错答（按概念分组）`,
     columns: [
-      { key: 'concept', label: '概念 / 关键词' },
-      { key: 'n', label: '错题数', width: 80 },
-      { key: 'docCount', label: '涉及文档', width: 80 },
-      { key: 'sample', label: '错题样例' },
+      { key: 'concept', label: '概念 / 关键词', sortable: 'text' },
+      { key: 'n', label: '错题数', width: 80, sortable: 'number' },
+      { key: 'docCount', label: '涉及文档', width: 80, sortable: 'number' },
+      { key: 'sample', label: '错题样例', sortable: 'text' },
     ],
     rows,
+    // 默认序=错题数降序（与上方 .sort 一致，v2.9 orderBy 契约声明化）
+    orderBy: [{ key: 'n', order: 'desc' }],
+    rowKeyField: 'concept',
     rowAction: { label: '按概念复习', method: 'startConceptPractice', paramKey: 'concept', when: { key: 'concept', op: 'neq', value: '（未匹配错题）' } },
-    // 归因页返回按钮：PackPage ?detail= 深链自带返回（v1 页契约），无需额外动作
+    // 死按钮修复（2026-10-03）：本页 payload 经 Deck v2.11 页面型结果通道就地换页呈现；
+    // 「返回题库」=再次返回页面型 payload（pageQuestionBank 主页面）——换页自带回程，无需独立返回栈
+    secondaryActions: [{ label: '返回题库', method: 'pageQuestionBank' }],
   }
 }
 
 /** 按概念复习（rowAction）：概念名 → 命中该标引词的文档（按错题数序）→ practiceInstant 即时出题开练 */
 async function startConceptPractice(conceptTitle) {
-  if (!moduleCtx) return { error: '做题生成器未激活' }
+  if (!moduleCtx) return { error: '练习未激活' }
   const norm = (x) => String(x || '').trim().toLowerCase().replace(/s+/g, '')
   const kwRows = (await moduleCtx.query(
     `SELECT s.doc_id AS docId, s.keywords_json FROM taxonomy_semantics s WHERE s.annotation_version >= 6`
   )) || []
   const docIds = []
   for (const r of kwRows) {
+    // 驼峰权威键优先、蛇形兼容别名兜底（旧宿主窗口；kernel-capability K0-1/K0-4）
     let kw = {}
-    try { kw = JSON.parse(r.keywords_json || '{}') } catch { kw = {} }
+    try { kw = JSON.parse(r.keywordsJson || r.keywords_json || '{}') } catch { kw = {} }
     const words = [kw.domain, kw.topic, kw.tech, ...(kw.tags || [])].map(norm).filter(Boolean)
     if (words.includes(norm(conceptTitle))) docIds.push(r.docId)
   }
   if (docIds.length === 0) return { error: `未找到概念「${conceptTitle}」关联的文档` }
   const docs = (await moduleCtx.getDocuments()) || []
-  const target = docs.find((d) => d.id === docIds[0])
-  if (!target?.file_path) return { error: '概念关联文档不可达' }
-  const caller = moduleCtx.invokePluginMethod || moduleCtx.invoke
-  if (!caller) return { error: '插件互调通道不可用' }
-  const r = await caller('quiz-maker', 'practiceInstant', [{ documentPath: target.file_path }])
+  const docById = new Map(docs.map((d) => [d.id, d]))
+  // 遍历取首个可达文档（K0-4）：此前只看 docIds[0]——语义行孤儿/首条失配即整体不可达（真机实证）
+  let target = null
+  for (const id of docIds) {
+    const d = docById.get(id)
+    const p = d && (d.filePath || d.file_path)
+    if (d && p) { target = { ...d, resolvedPath: p }; break }
+  }
+  if (!target) return { error: `概念「${conceptTitle}」关联的 ${docIds.length} 篇文档均不可达（可能需要重新索引知识库）` }
+  // 同插件直调（K0-4）：invokePluginMethod 为内置专属且不在沙箱 RPC 清单、invoke 需
+  // plugin:manage（仅内置）——自重入在沙箱下必死（真机实证）。ADR-201 §4 声明-执行
+  // 绑定按本插件已声明贡献放行，直调内部方法即可携带 ui 意图交中枢。
+  const r = await practiceInstant({ documentPath: target.resolvedPath })
   if (r && r.error) return { error: String(r.error) }
-  return { ui: r?.ui, message: `概念「${conceptTitle}」关联 ${docIds.length} 篇文档，已对《${target.title || ''}》即时出题开练` }
+  return { ui: r?.ui, message: `概念「${conceptTitle}」关联 ${docIds.length} 篇文档，已对《${target.title || target.docTitle || ''}》即时出题开练` }
 }
 
 /** nav.entry 行级动作（rowAction 契约，plugin:invoke 直调）：恢复已下架题，重新进入复习调度 */
 async function restoreBankQuestion(questionId) {
-  if (!moduleCtx) return { error: '做题生成器未激活' }
-  const all = (await moduleCtx.getQuestions({})) || []
+  if (!moduleCtx) return { error: '练习未激活' }
+  const all = (await caliber.getQuestions(moduleCtx.query, {})) || []
   const q = all.find((x) => x.id === questionId)
   if (!q) return { error: `未找到题目: ${questionId}` }
   if (q.status !== 'retired') return { message: '该题不在「已下架」状态，无需恢复。' }
-  await moduleCtx.restoreQuestion(questionId)
+  await qstore.restoreQuestion(moduleCtx, questionId)
   return { message: '✅ 题目已恢复，重新进入复习调度。' }
 }
 
 /** nav.entry 行级动作（rowActions 契约，2026-09-26）：下架在库题，退出复习调度（可恢复） */
 async function retireBankQuestion(questionId) {
-  if (!moduleCtx) return { error: '做题生成器未激活' }
-  const all = (await moduleCtx.getQuestions({})) || []
+  if (!moduleCtx) return { error: '练习未激活' }
+  const all = (await caliber.getQuestions(moduleCtx.query, {})) || []
   const q = all.find((x) => x.id === questionId)
   if (!q) return { error: `未找到题目: ${questionId}` }
   if (q.status === 'retired') return { message: '该题已是「已下架」状态。' }
-  await moduleCtx.retireQuestion(questionId)
+  await qstore.retireQuestion(moduleCtx, questionId)
   return { message: '该题已下架，退出复习调度（可在「已下架」筛选中恢复）。' }
 }
 
 /** 清空已下架（2026-09-26 用户反馈；破坏性动作——confirm 闸门在 PackPage Popconfirm）：
  *  物理删除全部 retired 题，返回删除数供用户回执；在库题与作答历史不受影响 */
 async function pagePurgeRetired() {
-  if (!moduleCtx) return { error: '做题生成器未激活' }
+  if (!moduleCtx) return { error: '练习未激活' }
   let purged = 0
   try {
-    purged = Number(await moduleCtx.purgeRetiredQuestions()) || 0
+    purged = Number(await qstore.purgeRetiredQuestions(moduleCtx)) || 0
   } catch (err) {
     return { error: `清空失败: ${String((err && err.message) || err).slice(0, 120)}` }
   }
@@ -659,7 +724,7 @@ function toAnkiTsvCopy(questions) {
   }
   const tagsOf = (q) => {
     const docName = q.documentPath ? String(q.documentPath).replace(/\\/g, '/').split('/').pop().replace(/\.[^.]+$/, '') : ''
-    return ['knomi', q.type || 'question', docName].filter(Boolean).map((t) => String(t).replace(/\s+/g, '_')).join(' ')
+    return ['knownest', q.type || 'question', docName].filter(Boolean).map((t) => String(t).replace(/\s+/g, '_')).join(' ')
   }
   const rows = (questions || []).filter((q) => q && q.question && q.answer)
     .map((q) => [frontOf(q), backOf(q), tagsOf(q)].map(field).join('\t'))
@@ -676,7 +741,9 @@ async function bankQuestionsForExport(filterArg) {
   const wanted = String(filterRepoName || '').trim()
   const scoped = wanted ? repos.find((r) => r.name === wanted) : null
   if (wanted && !scoped) return { error: `未找到仓库「${wanted}」，无法按此范围导出` }
-  const all = (await moduleCtx.getQuestions({ limit: 500, repoId: scoped ? scoped.id : undefined })) || []
+  // 导出口径=在库题（retired 已下架不随导出——题库页计数同式对账；BA-2 探针长期对账锚）
+  const allRaw = (await caliber.getQuestions(moduleCtx.query, { limit: 500, repoId: scoped ? scoped.id : undefined })) || []
+  const all = allRaw.filter((q) => q.status !== 'retired')
   let docs = []
   try { docs = (await moduleCtx.getDocuments()) || [] } catch { docs = [] }
   const docById = new Map(docs.map((d) => [d.id, d]))
@@ -704,21 +771,21 @@ async function bankQuestionsForExport(filterArg) {
 }
 
 async function exportBankJson(filterArg) {
-  if (!moduleCtx) return { error: '做题生成器未激活' }
+  if (!moduleCtx) return { error: '练习未激活' }
   const filterRepoName = filterRepoNameOf(filterArg)
   const { questions, scopeLabel, error } = await bankQuestionsForExport(filterRepoName)
   if (error) return { error }
   if (questions.length === 0) return { error: `当前范围（${scopeLabel}）没有可导出的题目` }
-  const payload = { app: 'knomi', type: 'question-bank', exportedAt: new Date().toISOString(), questions }
+  const payload = { app: 'knownest', type: 'question-bank', exportedAt: new Date().toISOString(), questions }
   const stamp = new Date().toISOString().slice(0, 10)
   return {
     message: `已导出 ${questions.length} 道题（${scopeLabel}）`,
-    download: { filename: `knomi-题库-${stamp}.json`, content: JSON.stringify(payload, null, 2), mime: 'application/json' },
+    download: { filename: `knownest-题库-${stamp}.json`, content: JSON.stringify(payload, null, 2), mime: 'application/json' },
   }
 }
 
 async function exportBankAnki(filterArg) {
-  if (!moduleCtx) return { error: '做题生成器未激活' }
+  if (!moduleCtx) return { error: '练习未激活' }
   const filterRepoName = filterRepoNameOf(filterArg)
   const { questions, scopeLabel, error } = await bankQuestionsForExport(filterRepoName)
   if (error) return { error }
@@ -726,51 +793,175 @@ async function exportBankAnki(filterArg) {
   const stamp = new Date().toISOString().slice(0, 10)
   return {
     message: `已导出 ${questions.length} 道题（${scopeLabel}）`,
-    download: { filename: `knomi-anki-${stamp}.txt`, content: toAnkiTsvCopy(questions), mime: 'text/plain' },
+    download: { filename: `knownest-anki-${stamp}.txt`, content: toAnkiTsvCopy(questions), mime: 'text/plain' },
   }
 }
 
+/** 导入题库 v2（2026-10-03 计划 §3.2：预览确认制）——解析（纯函数）→ 跨文档疑似重复预检 →
+ *  会话 stash → 返回 import.preview 意图（PackPage 开预览 Modal：计数对账/坏行逐行披露/仓库落点）。
+ *  本方法零落盘零入库；真正的写入在 confirmBankImport（用户显式确认后）。
+ *  失败也走预览 Modal（零题态）：坏行逐行可见 + 「下载模板」+「存入仓库让 AI 出题」双指路（§3.2.2 一等失败路径）。 */
 async function importBank(content, filename) {
-  if (!moduleCtx) return { error: '做题生成器未激活' }
+  if (!moduleCtx) return { error: '练习未激活' }
+  const raw = String(content || '')
+  const name = String(filename || '未命名').trim() || '未命名'
   let parsed
-  try { parsed = JSON.parse(String(content || '')) } catch { return { error: 'JSON 解析失败：不是有效的题库文件' } }
-  const questions = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.questions) ? parsed.questions : [])
-  if (questions.length === 0) return { error: '文件中没有题目（需要数组或 {questions:[...]}）' }
-  let docs = []
-  try { docs = (await moduleCtx.getDocuments()) || [] } catch { docs = [] }
-  const docIds = new Set(docs.map((d) => d.id))
+  try {
+    parsed = parsers.parseImport(raw, name)
+  } catch (err) {
+    return { error: `解析失败（${name}）：${String((err && err.message) || err).slice(0, 120)}` }
+  }
+  const questions = parsed.questions || []
+  const errors = parsed.errors || []
+  if (questions.length === 0 && errors.length === 0) errors.push({ line: 1, reason: '没有可识别的题目' })
+  // 跨文档疑似重复预检（question 文本粗匹配——诚实披露「疑似」，写入去重仍由 content_hash 权威）
+  let duplicateCount = 0
+  try {
+    const texts = [...new Set(questions.map((q) => q.question))].slice(0, 100)
+    if (texts.length > 0) {
+      const rows = (await moduleCtx.query(
+        `SELECT DISTINCT question FROM quiz_maker_questions WHERE question IN (${texts.map(() => '?').join(',')})`,
+        texts
+      )) || []
+      const set = new Set(rows.map((r) => String(r.question)))
+      duplicateCount = questions.filter((q) => set.has(q.question)).length
+    }
+  } catch { duplicateCount = 0 }
+  const importId = 'imp_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8)
+  importSessions.set(importId, { filename: name, format: parsed.format, questions, errors, createdAt: Date.now() })
+  if (importSessions.size > 20) importSessions.delete(importSessions.keys().next().value)
+  let repos = []
+  try { repos = (await moduleCtx.listRepositories()) || [] } catch { repos = [] }
+  return {
+    ui: {
+      intent: 'import.preview',
+      importId,
+      filename: name,
+      format: parsed.format,
+      counts: { total: questions.length, failed: errors.length, duplicate: duplicateCount },
+      errors: errors.slice(0, 20),
+      // 收敛点批：承载文档固定落 sys-hub 工作空间——预览不再提供选仓（如实单选项）
+      repos: ['sys-hub'],
+    },
+  }
+}
+
+/** 确认导入（预览 Modal 确认按钮）：承载文档落库 → 同步索引 → 逐题入库（content_hash 去重，
+ *  sourceSnippet=承载文档分节正文逐字锚定，generator='导入' 独立署名进健康度分组）。
+ *  D4 同名追加：既有承载文档按分节正文去重后追加，不覆盖。 */
+async function confirmBankImport(importId, repoName) {
+  if (!moduleCtx) return { error: '练习未激活' }
+  const session = importSessions.get(String(importId || ''))
+  if (!session) return { error: '导入会话已失效（预览超时或插件已重载），请重新选择文件导入' }
+  let repos = []
+  try { repos = (await moduleCtx.listRepositories()) || [] } catch { repos = [] }
+  // 收敛点批 2026-10-10：承载文档绑回 sys-hub 工作空间（repoName 参数退役不再参与选仓——
+  // 仓库参数曾默认落第一仓漂移用户内容仓；系统产物只认 sys-hub，不回退）
+  const repo = repos.find((r) => r && r.name === 'sys-hub')
+  if (!repo || !repo.localPath) return { error: 'sys-hub 仓库不可用，无法落承载文档（系统产物只认 sys-hub）' }
+  const safeBase = (session.filename
+    .replace(/[\\/:*?"<>|\r\n]+/g, '_')
+    .replace(/\.(csv|tsv|txt|json|md)$/i, '') || '导入题目').slice(0, 80)
+  const mdName = safeBase + '.md'
+  const carrierPath = repo.localPath.replace(/[\\/]+$/, '') + '/quiz-maker/bank-import/' + mdName
+  const built = parsers.buildCarrierMarkdown(session.filename, session.questions)
+  let existing = ''
+  try { existing = String((await moduleCtx.readFile(carrierPath)) || '') } catch { existing = '' }
+  let markdown
+  if (existing.trim() === '') {
+    markdown = built.markdown
+  } else {
+    // D4 同名追加：分节正文已存在（原样重导）则不重复追加
+    const fresh = built.sections.filter((sec) => !existing.includes(sec))
+    markdown = fresh.length === 0 ? existing : existing.replace(/\r?\n$/, '') + '\n\n' + fresh.join('\n\n') + '\n'
+  }
+  try {
+    await moduleCtx.writeFile(carrierPath, markdown)
+  } catch (err) {
+    return { error: `承载文档写入失败：需要「文件写入（file:write）」权限——请在「插件」页找到练习，授权后重试导入（已解析内容保留，重试不重复入库）。${String((err && err.message) || err).slice(0, 80)}` }
+  }
+  try {
+    await moduleCtx.reindexRepository(repo.id)
+  } catch { /* 索引失败时下方 find 兜底报错 */ }
+  const docs = (await moduleCtx.getDocuments()) || []
+  const target = docs.find((d) => d.filePath && String(d.filePath).replace(/[\\/]+/g, '/').toLowerCase().endsWith('/quiz-maker/bank-import/' + mdName.toLowerCase()))
+  if (!target) return { error: `承载文档已写入但索引未就位（quiz-maker/bank-import/${mdName}）：请稍后重试导入，重复题会自动去重不翻倍` }
   let imported = 0
   let duplicates = 0
   let skipped = 0
-  for (const q of questions) {
-    if (!q || !q.question || !q.answer || !q.sourceSnippet || !q.documentId || !docIds.has(q.documentId)) { skipped++; continue }
+  const createdIds = []
+  for (let i = 0; i < session.questions.length; i++) {
+    const q = session.questions[i]
     try {
-      const r = await moduleCtx.insertQuestion({
-        documentId: q.documentId,
-        type: ['single_choice', 'multi_choice', 'true_false', 'fill_blank', 'ordering', 'short_answer', 'mixed'].includes(q.type) ? q.type : 'single_choice',
-        question: String(q.question),
+      const r = await qstore.insertQuestion(moduleCtx, {
+        documentId: target.id,
+        type: q.type,
+        question: q.question,
         options: Array.isArray(q.options) ? q.options.map(String) : undefined,
-        answer: String(q.answer),
+        answer: q.answer,
         explanation: q.explanation ? String(q.explanation) : undefined,
-        sourceSnippet: String(q.sourceSnippet),
+        sourceSnippet: built.sections[i],
         pluginId: 'quiz-import',
+        generator: '导入',
       })
-      if (r.created) imported++
-      else if (r.duplicate) duplicates++
+      if (r.created) { imported++; createdIds.push(r.id) } else if (r.duplicate) duplicates++
       else skipped++
     } catch { skipped++ }
   }
-  const name = filename ? `（${filename}）` : ''
-  return { message: `✅ 导入完成${name}：新增 ${imported}，重复 ${duplicates}，跳过 ${skipped}` }
+  importSessions.delete(String(importId))
+  // 行动化后继（§3.2.1 态6 / FR-118 惯例）：新建题映射为做题卡，预览 Modal「开练导入题」一键直达
+  let practice
+  if (createdIds.length > 0) {
+    try {
+      const all = (await caliber.getQuestions(moduleCtx.query, { limit: 500 })) || []
+      const docPathById = new Map(docs.map((d) => [d.id, d.filePath]))
+      const created = all.filter((q) => createdIds.indexOf(q.id) >= 0).map((q) => toPracticeQuestion(q, docPathById))
+      if (created.length > 0) practice = { title: `导入练习（${created.length} 题）`, questions: created }
+    } catch { practice = undefined }
+  }
+  return {
+    message: `✅ 导入完成（${session.filename}）：新增 ${imported} · 重复 ${duplicates} · 跳过 ${skipped} · 承载文档「quiz-maker/bank-import/${mdName}」`,
+    practice,
+  }
+}
+
+/** 下载导入模板（CSV；失败路径与预览 Modal 双指路之一，§3.2.2/§3.2.3） */
+function downloadImportTemplate() {
+  return {
+    message: '导入模板已保存到系统下载目录：按列填写后在题库页「导入题库」选择该文件',
+    download: { filename: 'knownest-题库导入模板.csv', content: parsers.buildTemplateCsv(), mime: 'text/csv' },
+  }
+}
+
+/** 导出格式选择（§3.3 导出三合一的无勾选分支）：Deck 携勾选走 share.export 意图不经此；
+ *  无勾选回退本方法 → PackPage 开导出 Modal（JSON / Anki TSV 二选一，调既有 exportBankJson/Anki） */
+function exportBankChoose() {
+  return { ui: { intent: 'export.choose' } }
+}
+
+/** Agent 补题（§3.3 补题两合一）：原「一键补题」handoff 直达 + 原「复制出题指令」随剪贴板——
+ *  自动路径一步到位，手动粘贴路径不丢失。无未覆盖知识点时如实披露。 */
+async function pageAgentSupplement(filterArg) {
+  const handoff = await pageExpandHandoff()
+  if (handoff.error) return handoff
+  const prompt = await pageGeneratePrompt(filterArg)
+  const promptText = typeof prompt.clipboard === 'string' ? prompt.clipboard : undefined
+  return {
+    message: promptText
+      ? '已交给白泽补题（新会话将自动发送补题指令）；指令文本已同时复制到剪贴板，也可手动粘贴'
+      : `已交给白泽补题。${prompt.message || ''}`.trim(),
+    ui: handoff.ui,
+    clipboard: promptText,
+  }
 }
 
 /** 复制出题指令：未覆盖知识点（0 题挂接）→ 出题官话术入剪贴板（不直连 agent——pack 页与 agent 解耦） */
 async function pageGeneratePrompt(filterArg) {
-  if (!moduleCtx) return { error: '做题生成器未激活' }
+  if (!moduleCtx) return { error: '练习未激活' }
   const filterRepoName = filterRepoNameOf(filterArg)
   let kps = []
   try { kps = (await moduleCtx.getKnowledgePoints()) || [] } catch { kps = [] }
-  const all = (await moduleCtx.getQuestions({ limit: 500 })) || []
+  const all = (await caliber.getQuestions(moduleCtx.query, { limit: 500 })) || []
   const kpQ = new Map()
   for (const q of all) if (q.knowledgePointId) kpQ.set(q.knowledgePointId, (kpQ.get(q.knowledgePointId) || 0) + 1)
   const uncovered = kps.filter((k) => !kpQ.get(k.id)).slice(0, 8)
@@ -778,7 +969,7 @@ async function pageGeneratePrompt(filterArg) {
   const hint = uncovered.map((k) => `「${k.title}」`).join('、')
   return {
     clipboard: `这套文档还有 ${uncovered.length} 个知识点没出过题：${hint}。请针对这些知识点生成练习题并直接开始做题`,
-    message: '出题指令已复制，粘贴给小诺即可开始出题',
+    message: '出题指令已复制，粘贴给白泽即可开始出题',
   }
 }
 
@@ -814,7 +1005,7 @@ async function fetchDueRows(limit) {
   return (await moduleCtx.query(
     `SELECT q.id, q.document_id AS documentId, q.knowledge_point_id AS knowledgePointId, q.type, q.question,
             q.options_json AS optionsJson, q.answer, q.explanation, q.source_snippet AS sourceSnippet, q.plugin_id AS pluginId, q.verified, q.generator, q.created_at AS createdAt, q.cognitive_level AS cognitiveLevel
-     FROM questions q
+     FROM quiz_maker_questions q
      WHERE q.status != 'retired' AND q.next_review_at IS NOT NULL AND q.next_review_at != '' AND q.next_review_at <= ?
      ORDER BY q.next_review_at
      LIMIT ${Math.min(Math.max(Number(limit) || 20, 1), 20)}`,
@@ -822,13 +1013,12 @@ async function fetchDueRows(limit) {
   )) || []
 }
 
-/** 冲刺窗口判定已收敛宿主 studyRhythm() 单一权威（2026-09-23 节奏计划，readSprintInfo 经其消费）。 */
+/** 冲刺窗口判定经 study-coach/rhythm-config 资产门（2026-10-14 C3 资产化：宿主 ctx.studyRhythm 中转退役，
+ *  节奏判定唯一权威=study-reminder 自持 lib/sprint，本包消费改道资产门） */
 async function readSprintInfo() {
-  // 冲刺窗口判定已收敛宿主 studyRhythm() 单一权威（2026-09-23 节奏计划）：原裸 SQL 跨读
-  // study-reminder plugin_kv + sprintInfo 双包镜像一并删除（ rhythms 语义含 sprint_days=0=仅考试当天）
   if (!moduleCtx) return { active: false }
   try {
-    return (await moduleCtx.studyRhythm()).sprint
+    return ((await moduleCtx.invokeAsset('study-coach/rhythm-config', 'getRhythmConfig', [])) || {}).sprint || { active: false }
   } catch {
     return { active: false }
   }
@@ -839,7 +1029,7 @@ async function fetchQuestionById(id) {
   const rows = (await moduleCtx.query(
     `SELECT q.id, q.document_id AS documentId, q.knowledge_point_id AS knowledgePointId, q.type, q.question,
             q.options_json AS optionsJson, q.answer, q.explanation, q.source_snippet AS sourceSnippet, q.plugin_id AS pluginId, q.verified, q.generator, q.created_at AS createdAt, q.cognitive_level AS cognitiveLevel
-     FROM questions q WHERE q.id = ?`,
+     FROM quiz_maker_questions q WHERE q.id = ?`,
     [id]
   )) || []
   return rows[0] || null
@@ -851,7 +1041,10 @@ async function fetchQuestionById(id) {
  *  到期集经 ctx.query 直取（全库权威口径，不受 500 行展示窗口截断）；query 不可用退回窗口过滤。
  *  返回 { message } 或 { message, ui }——ui 交中枢意图分发器进入做题视图（与即时出题同链路） */
 async function startBankPractice() {
-  if (!moduleCtx) return { error: '做题生成器未激活' }
+  if (!moduleCtx) return { error: '练习未激活' }
+  // 缺包边界（B1 片 2）：店表缺失时显式引导（同题库页），不裸抛 sqlite 错
+  const missing = await qstore.storeMissingNotice(moduleCtx)
+  if (missing) return { error: missing }
   const sprint = await readSprintInfo()
   let due = []
   try {
@@ -859,7 +1052,7 @@ async function startBankPractice() {
       due = (await moduleCtx.query(
         `SELECT q.id, q.document_id AS documentId, q.knowledge_point_id AS knowledgePointId, q.type, q.question,
                 q.options_json AS optionsJson, q.answer, q.explanation, q.source_snippet AS sourceSnippet, q.plugin_id AS pluginId, q.verified, q.generator, q.created_at AS createdAt, q.cognitive_level AS cognitiveLevel
-         FROM questions q
+         FROM quiz_maker_questions q
          WHERE q.status != 'retired'
          ORDER BY (q.next_review_at IS NULL) DESC, q.next_review_at
          LIMIT 40`,
@@ -868,12 +1061,12 @@ async function startBankPractice() {
       due = await fetchDueRows(20)
     }
   } catch {
-    const all = (await moduleCtx.getQuestions({ limit: 500 })) || []
+    const all = (await caliber.getQuestions(moduleCtx.query, { limit: 500 })) || []
     const now = Date.now()
     due = all.filter((q) => q.status !== 'retired' && q.nextReviewAt && new Date(q.nextReviewAt).getTime() <= now).slice(0, 20)
   }
   if (due.length === 0) {
-    return { message: '今日无到期题目。可对小诺说「根据文档出题」生成新练习，本题库中的在库题也会按期进入复习。' }
+    return { message: '今日无到期题目。可对白泽说「根据文档出题」生成新练习，本题库中的在库题也会按期进入复习。' }
   }
   let docs = []
   try { docs = (await moduleCtx.getDocuments()) || [] } catch { docs = [] }
@@ -902,7 +1095,7 @@ async function startBankPractice() {
 
 /** 题型偏好切换（secondaryActions，UX 走查 #5）：读-翻-写 practice_objective_first 配置 */
 async function toggleObjectiveFirst() {
-  if (!moduleCtx) return { error: '做题生成器未激活' }
+  if (!moduleCtx) return { error: '练习未激活' }
   let cur = false
   try { cur = Boolean((await moduleCtx.getConfig()).practice_objective_first) } catch { cur = false }
   const next = !cur
@@ -919,13 +1112,13 @@ const EXPAND_BUDGET = 6000
 const normText = (s) => String(s || '').toLowerCase().replace(/\s+/g, '')
 
 /** 未覆盖/薄弱知识点 TopN + 材料支撑闸 + 7 天冷却（plugin_kv expand 命名空间）。
- *  被 knomi-agent expand_question_bank 经 invokePluginMethod 调用；args.mark=false 为 dry-run（探针用，不写冷却）。
+ *  被 baize expand_question_bank 经 invokePluginMethod 调用；args.mark=false 为 dry-run（探针用，不写冷却）。
  *  H2 教训闸：KP 标题未命中宿主文档内容（正文或标题行）= 无材料支撑，跳过不产出——绝不造贴标签题 */
 async function selectExpansionTargets(args = {}) {
-  if (!moduleCtx) return { error: '做题生成器未激活' }
+  if (!moduleCtx) return { error: '练习未激活' }
   // 清偿保险丝（批次 D-5，教育评审缺口 2）：到期积压超过近 7 天日均作答 ×2 → 先清偿再补题
   try {
-    const rhythm = await moduleCtx.studyRhythm()
+    const rhythm = await moduleCtx.invokeAsset('study-coach/rhythm-config', 'getRhythmConfig', []).catch(() => null)
     const fuse = rhythm && rhythm.backlogFuse
     if (fuse && fuse.tripped) {
       return { error: `复习债超限：到期 ${fuse.dueCount} 题 > 清偿能力（日均 ${fuse.dailyAvg} 题 × 2 = ${fuse.threshold}）——请先完成「今日复习」清偿积压，再补新题` }
@@ -935,7 +1128,7 @@ async function selectExpansionTargets(args = {}) {
   const uncovered = (await moduleCtx.query(
     `SELECT kp.id, kp.title, kp.document_id AS documentId, kp.created_at
      FROM knowledge_points kp
-     LEFT JOIN questions q ON q.knowledge_point_id = kp.id
+     LEFT JOIN quiz_maker_questions q ON q.knowledge_point_id = kp.id
      WHERE q.id IS NULL
      ORDER BY kp.created_at
      LIMIT 60`
@@ -945,8 +1138,8 @@ async function selectExpansionTargets(args = {}) {
             COUNT(a.id) AS attempts,
             SUM(CASE WHEN a.correct = 1 THEN 1 ELSE 0 END) AS correctCount
      FROM knowledge_points kp
-     JOIN questions q ON q.knowledge_point_id = kp.id
-     LEFT JOIN question_attempts a ON a.question_id = q.id
+     JOIN quiz_maker_questions q ON q.knowledge_point_id = kp.id
+     LEFT JOIN quiz_maker_question_attempts a ON a.question_id = q.id
      WHERE q.status != 'retired'
      GROUP BY kp.id
      HAVING COUNT(a.id) >= 2 AND SUM(CASE WHEN a.correct = 1 THEN 1 ELSE 0 END) * 100 < COUNT(a.id) * 60
@@ -959,7 +1152,7 @@ async function selectExpansionTargets(args = {}) {
   try {
     const c1 = (await moduleCtx.query(
       `SELECT COUNT(*) AS n FROM knowledge_points kp
-       LEFT JOIN questions q ON q.knowledge_point_id = kp.id
+       LEFT JOIN quiz_maker_questions q ON q.knowledge_point_id = kp.id
        WHERE q.id IS NULL`
     )) || []
     if (c1[0] && c1[0].n != null) uncoveredTotal = Number(c1[0].n) || 0
@@ -969,8 +1162,8 @@ async function selectExpansionTargets(args = {}) {
       `SELECT COUNT(*) AS n FROM (
          SELECT kp.id
          FROM knowledge_points kp
-         JOIN questions q ON q.knowledge_point_id = kp.id
-         LEFT JOIN question_attempts a ON a.question_id = q.id
+         JOIN quiz_maker_questions q ON q.knowledge_point_id = kp.id
+         LEFT JOIN quiz_maker_question_attempts a ON a.question_id = q.id
          WHERE q.status != 'retired'
          GROUP BY kp.id
          HAVING COUNT(a.id) >= 2 AND SUM(CASE WHEN a.correct = 1 THEN 1 ELSE 0 END) * 100 < COUNT(a.id) * 60
@@ -1052,10 +1245,10 @@ async function selectExpansionTargets(args = {}) {
 /** 清除补题冷却（批次 A 探针可重入支撑，T10：写型探针必须可清理自身副作用）。
  *  冷却键只为「未覆盖+薄弱候选」而写——按同一候选全集逐键删除即可全覆盖 */
 async function clearExpansionCooldown() {
-  if (!moduleCtx) return { error: '做题生成器未激活' }
+  if (!moduleCtx) return { error: '练习未激活' }
   const kpLists = (await Promise.all([
-    moduleCtx.query(`SELECT kp.id FROM knowledge_points kp LEFT JOIN questions q ON q.knowledge_point_id = kp.id WHERE q.id IS NULL`),
-    moduleCtx.query(`SELECT DISTINCT kp.id FROM knowledge_points kp JOIN questions q ON q.knowledge_point_id = kp.id WHERE q.status != 'retired'`),
+    moduleCtx.query(`SELECT kp.id FROM knowledge_points kp LEFT JOIN quiz_maker_questions q ON q.knowledge_point_id = kp.id WHERE q.id IS NULL`),
+    moduleCtx.query(`SELECT DISTINCT kp.id FROM knowledge_points kp JOIN quiz_maker_questions q ON q.knowledge_point_id = kp.id WHERE q.status != 'retired'`),
   ]).then(([a, b]) => [...a, ...b]).catch(() => [])) || []
   let cleared = 0
   for (const kp of kpLists) {
@@ -1067,9 +1260,9 @@ async function clearExpansionCooldown() {
 /** 一键补题（批次 A 1-5）：agent_handoff 意图预填补题指令（复用 FR-124 到达即开工模式；
  *  PackPage handleActionResult 统一分发 ui 意图 → 编辑器停靠 + 新会话自动发送） */
 async function pageExpandHandoff() {
-  if (!moduleCtx) return { error: '做题生成器未激活' }
+  if (!moduleCtx) return { error: '练习未激活' }
   return {
-    message: '已交给小诺补题（新会话将自动发送补题指令）',
+    message: '已交给白泽补题（新会话将自动发送补题指令）',
     ui: {
       intent: 'agent_handoff',
       message: '请根据知识库未覆盖的知识点补题：调用 expand_question_bank 选取目标，按返回的任务书逐知识点委派「出题官」出题，最后用 generate_questions 入库（每题必带 knowledgePointTitle 与 documentId，sourceSnippet 逐字摘自任务书材料）。',
@@ -1077,12 +1270,39 @@ async function pageExpandHandoff() {
   }
 }
 
+/** 按文档出题的前置查证（知识导航树叶「出题」图标，2026-10-22）：只回结构化事实，
+ *  **零模型调用、零用户文案**——界面出词归内核词典（kernel-i18n 红线：插件不得新增中文 UI 串），
+ *  草稿由渲染层用查证结果拼装。真正出题仍走白泽 →「出题官」→ generate_questions（接地+盲答双闸门）。
+ *  返回：{ ok: true, documentId, documentTitle, existingCount } 或 { ok: false, code }。 */
+async function authorQuestionsForDoc(documentPath) {
+  if (!moduleCtx) return { ok: false, code: 'not-active' }
+  const raw = String(documentPath || '').trim()
+  if (!raw) return { ok: false, code: 'missing-path' }
+  const norm = (p) => String(p || '').replace(/\\/g, '/').toLowerCase()
+  let doc = null
+  try {
+    const docs = (await moduleCtx.getDocuments()) || []
+    doc = docs.find((d) => norm(d.filePath) === norm(raw)) || null
+  } catch { doc = null }
+  if (!doc) return { ok: false, code: 'doc-not-found' }
+  // 已有题数如实披露（不阻止再出题：按文档补题/换题型/覆盖新知识点都是正常诉求）
+  let existing = 0
+  try {
+    const rows = (await moduleCtx.query(
+      `SELECT COUNT(*) AS n FROM quiz_maker_questions WHERE document_id = ? AND status != 'retired'`,
+      [doc.id]
+    )) || []
+    existing = Number(rows[0] && rows[0].n) || 0
+  } catch { existing = 0 }
+  return { ok: true, documentId: String(doc.id), documentTitle: String(doc.title || raw), existingCount: existing }
+}
+
 /** nav.entry 行点击动作（payload.rowClick 契约，plugin:invoke 直调）：单题开练。
  *  出题序定论（与 startBankPractice 同序）：点击题为第 1 题，后续按 SM-2 调度序连练到期题
  *  （next_review_at 升序，最久到期优先；确定性出题，非随机——防背题由选项洗牌承担），
  *  排除点击题防重复、排除已下架题，连练至多 20 题。 */
 async function practiceQuestion(questionId) {
-  if (!moduleCtx) return { error: '做题生成器未激活' }
+  if (!moduleCtx) return { error: '练习未激活' }
   let first = null
   try {
     first = await fetchQuestionById(questionId)
@@ -1090,7 +1310,7 @@ async function practiceQuestion(questionId) {
     first = null
   }
   if (!first) {
-    const all = (await moduleCtx.getQuestions({ limit: 500 })) || []
+    const all = (await caliber.getQuestions(moduleCtx.query, { limit: 500 })) || []
     first = all.find((q) => q.id === questionId) || null
   }
   if (!first) return { error: `未找到题目: ${questionId}` }
@@ -1114,12 +1334,341 @@ async function practiceQuestion(questionId) {
 
 module.exports = {
   id: PLUGIN_ID,
-  name: '做题生成器',
-  version: '0.20.0',
+  name: '练习',
+  version: '0.42.0',
+
+  // ---- 数据资产查询面（capability-asset-layering T6 叙事归属：内核底座经本插件目录暴露）----
+  async listQuestions(args) {
+    const filter = args && typeof args === 'object' ? args : {}
+    let rows = (await caliber.getQuestions(moduleCtx.query, filter)) || []
+    // order='created_asc'：建题序（听写句序=题创建序，listening-drill 句子载荷语义）
+    if (filter.order === 'created_asc') rows = [...rows].reverse()
+    return rows.slice(0, Math.min(Number(filter && filter.limit) || 200, 500))
+  },
+  async listDueQuestions(args) {
+    const limit = Math.min(Number(args && args.limit) || 50, 200)
+    return (await caliber.getQuestionsForReview(moduleCtx.query, limit)) || []
+  },
+
+  // ---- 题域写门（P3 2026-10-14 设立，B1 片 2 2026-10-15 起自持实现）：非属主消费方经
+  //  invokeAsset('quiz-maker/questions', '<方法>', [args])，consumes 声明即授权。
+  //  实现归属变更：宿主属主 ctx 单点（随属主块退役）→ 本插件自店写（lib/question-store，
+  //  ctx.store.exec + 插件侧日配额/校验语义不变；日配额 B4.6 2026-10-15 用户拍板起暂不设限，
+  //  拦截结构与 KV 计次台账保留待配额机制完善）；资产契约面（方法名/参数/返回形状/错误码）
+  //  不变——listening-drill/mistake-analyzer/interviewer/question-radar 四消费方零改动。----
+  /** 题目入库（题目入库唯一资产写门；listening-drill/interviewer 等出题方消费） */
+  async insertQuestion(args) {
+    if (!moduleCtx || !moduleCtx.store) {
+      return { id: '', created: false, duplicate: false, reason: '题域写面不可用（自持店表未就绪）' }
+    }
+    return qstore.insertQuestion(moduleCtx, args)
+  },
+  /** 退回题目（差评题退出复习队列；mistake-analyzer retire_question 消费） */
+  async retireQuestion(args) {
+    const questionId = String(args && args.questionId || '')
+    if (!questionId) return { error: '缺少 questionId' }
+    if (!moduleCtx || !moduleCtx.store) return { error: '题域写面不可用（自持店表未就绪）' }
+    await qstore.retireQuestion(moduleCtx, questionId)
+    return { ok: true }
+  },
+  /** 用户纠错/评价回流（分型处置；mistake-analyzer retire_question 消费） */
+  async flagQuestionFeedback(args) {
+    if (!moduleCtx || !moduleCtx.store) {
+      return { error: '题域写面不可用（自持店表未就绪）' }
+    }
+    return qstore.flagQuestionFeedback(moduleCtx, args)
+  },
+  /** 按出题者清理退役题的反馈行（question-radar 探针收尾清场消费） */
+  async purgeRetiredQuestionFeedback(args) {
+    const generator = String(args && args.generator || '')
+    if (!moduleCtx || !moduleCtx.store) return { purged: 0, error: '题域写面不可用（自持店表未就绪）' }
+    const n = await qstore.purgeRetiredQuestionFeedback(moduleCtx, generator)
+    return { purged: Number(n) || 0 }
+  },
+
+  /**
+   * 学习统计聚合资产（平台化计划 P2：统计口径单一实现铁律——消费方全部经本资产取数，
+   * 禁自拼 SQL 直读题域表）。节化取数：args.sections 声明所需节，缺省最小集。
+   * 双轨期实现语义：ctx 学习方法转发（kernel 单一实现不变）+ 域属主过渡授裸 SQL
+   * （题域残表仍内核物理，各消费方原查询 verbatim 迁入；残表迁店后收进自店读）。
+   * 逐节独立降级：单节失败置空不拖垮整资产（消费方按空降级，行为同各自原 try/catch）。
+   */
+  async getStudyStats(args = {}) {
+    const a = args && typeof args === 'object' ? args : {}
+    const ALL = ['summary', 'dueBreakdown', 'dueQueue', 'debtStats', 'weakDocs', 'streak', 'docStats', 'attemptsByDay', 'firstTaggedDay', 'dueFroms', 'docAccuracy', 'byGenerator', 'bankQuality', 'dueHistogram', 'wrongAttempts', 'attempts', 'clearedCount', 'docMistakes', 'gateStats', 'uncoveredKps', 'weakKps', 'effectRows', 'weakDomains', 'kpQuestionCount', 'retentionSeries', 'masteryByKp', 'domainHeatmap', 'plannerPlan']
+    const sections = Array.isArray(a.sections) && a.sections.length ? a.sections : ['summary', 'dueBreakdown', 'streak']
+    const want = new Set(sections.filter((k) => ALL.includes(k)))
+    const out = { generatedAt: new Date().toISOString() }
+    const clamp = (v, lo, hi, dflt) => { const n = Number(v); return Number.isFinite(n) ? Math.min(Math.max(Math.round(n), lo), hi) : dflt }
+    const q1 = async (sql, params) => { try { return ((await moduleCtx.query(sql, params)) || []) } catch { return [] } }
+
+    if (want.has('summary')) {
+      try { out.summary = (await caliber.getStudySummary(moduleCtx.query, a.repoId ? { repoId: a.repoId } : undefined)) || null } catch { out.summary = null }
+    }
+    if (want.has('dueBreakdown')) {
+      try { out.dueBreakdown = (await caliber.getDueBreakdown(moduleCtx.query)) || null } catch { out.dueBreakdown = null }
+    }
+    if (want.has('dueQueue')) {
+      // 今日集取数（study-coach 决策内核消费）：到期文档队列（id/标题/到期时刻/正确率，到期升序）
+      try { out.dueQueue = (await caliber.getDueQueue(moduleCtx.query, clamp(a.limit, 1, 200, 50))) || [] } catch { out.dueQueue = [] }
+    }
+    if (want.has('debtStats')) {
+      // 清偿保险丝容量口径（rhythm-config 资产化 2026-10-14：近 7 天作答行数+日均，供 study-reminder 合成保险丝）
+      try { out.debtStats = (await caliber.getPracticeDebtStats(moduleCtx.query)) || null } catch { out.debtStats = null }
+    }
+    if (want.has('weakDocs')) {
+      try { out.weakDocs = (await caliber.getWeakDocs(moduleCtx.query, clamp(a.weakLimit, 1, 20, 5))) || [] } catch { out.weakDocs = [] }
+    }
+    if (want.has('streak')) {
+      try { out.streak = (await caliber.getStreak(moduleCtx.query)) || null } catch { out.streak = null }
+    }
+    if (want.has('docStats')) {
+      try { out.docStats = (await caliber.getDocStats(moduleCtx.query, a.docFilter && typeof a.docFilter === 'object' ? a.docFilter : {})) || [] } catch { out.docStats = [] }
+    }
+    if (want.has('attemptsByDay')) {
+      // 日作答+日清偿（study-analytics loadStreakInputs 原查询 verbatim 迁入）
+      out.attemptsByDay = await q1(
+        `SELECT DATE(answered_at, 'localtime') AS day,
+                COUNT(DISTINCT document_id) AS n,
+                COUNT(DISTINCT CASE WHEN was_due = 1 THEN document_id END) AS cleared
+         FROM quiz_maker_practice_attempts GROUP BY day`
+      )
+    }
+    if (want.has('firstTaggedDay')) {
+      const rows = await q1(`SELECT DATE(MIN(answered_at), 'localtime') AS day FROM quiz_maker_practice_attempts WHERE was_due IS NOT NULL`)
+      out.firstTaggedDay = (rows[0] && rows[0].day && String(rows[0].day)) || null
+    }
+    if (want.has('dueFroms')) {
+      // 全文档到期起点（study-analytics loadStreakInputs 原查询 verbatim 迁入；
+      // 复习态在自店表 quiz_maker_doc_review（P1c 摘列），行缺省 = 从未练习 → created_at 即到期）
+      out.dueFroms = await q1(
+        `SELECT COALESCE(NULLIF(dr.next_review_at, ''), d.created_at) AS dueFrom
+         FROM documents d LEFT JOIN quiz_maker_doc_review dr ON dr.doc_id = d.id`
+      )
+    }
+    if (want.has('docAccuracy')) {
+      // 题均正确率薄弱文档（link-tagger weakDocTitles 原查询 verbatim 迁入）
+      out.docAccuracy = await q1(
+        `SELECT DISTINCT d.title AS title FROM quiz_maker_questions q
+         JOIN documents d ON q.document_id = d.id
+         WHERE q.status = 'confirmed' AND (
+           SELECT AVG(CASE WHEN a.correct = 1 THEN 100.0 ELSE 0 END)
+           FROM quiz_maker_question_attempts a WHERE a.question_id = q.id
+         ) < 60 LIMIT ${clamp(a.docAccuracyLimit, 1, 50, 8)}`
+      )
+    }
+    if (want.has('byGenerator')) {
+      // 生成器署名统计（question-radar healthByGenerator 原查询 verbatim 迁入：题数/有效差评/验证占比）
+      const rows = await q1(
+        `SELECT COALESCE(NULLIF(q.generator, ''), '未署名') AS generator,
+                COUNT(DISTINCT q.id) AS total,
+                SUM(CASE WHEN q.status != 'retired' THEN 1 ELSE 0 END) AS active,
+                SUM(CASE WHEN q.verified = 1 THEN 1 ELSE 0 END) AS verified
+         FROM quiz_maker_questions q GROUP BY COALESCE(NULLIF(q.generator, ''), '未署名')`
+      )
+      const fb = await q1(
+        `SELECT COALESCE(NULLIF(q.generator, ''), '未署名') AS generator, f.kind, COUNT(*) AS n
+         FROM quiz_maker_question_feedback f LEFT JOIN quiz_maker_questions q ON q.id = f.question_id
+         GROUP BY COALESCE(NULLIF(q.generator, ''), '未署名'), f.kind`
+      )
+      const fbByGen = new Map()
+      for (const r of fb) {
+        const g = fbByGen.get(r.generator) || { bad: 0, good: 0, wrong: 0 }
+        if (r.kind === 'bad_question') g.bad += Number(r.n) || 0
+        if (r.kind === 'good_question') g.good += Number(r.n) || 0
+        if (r.kind === 'wrong_answer') g.wrong += Number(r.n) || 0
+        fbByGen.set(r.generator, g)
+      }
+      out.byGenerator = rows.map((r) => ({ ...r, ...(fbByGen.get(r.generator) || { bad: 0, good: 0, wrong: 0 }) }))
+    }
+    if (want.has('bankQuality')) {
+      // 题库质量计数（question-radar 自检原查询 verbatim 迁入：验证/死题/探针反馈/过期调度）
+      const one = async (sql) => { const rows = await q1(sql); return rows[0] || {} }
+      out.bankQuality = {
+        verified: await one(`SELECT COUNT(*) total, SUM(CASE WHEN verified=1 THEN 1 ELSE 0 END) v FROM quiz_maker_questions WHERE status!='retired'`),
+        dead: await one(`SELECT COUNT(*) total, SUM(CASE WHEN NOT EXISTS(SELECT 1 FROM quiz_maker_question_attempts a WHERE a.question_id=q.id) AND NOT EXISTS(SELECT 1 FROM quiz_maker_practice_attempts pa WHERE json_extract(pa.question_snapshot,'$.id')=q.id) THEN 1 ELSE 0 END) dead FROM quiz_maker_questions q WHERE q.status='confirmed'`),
+        probe: await one(`SELECT COUNT(*) n FROM quiz_maker_question_feedback f JOIN quiz_maker_questions q ON q.id=f.question_id WHERE q.generator='题源雷达' AND q.status='retired'`),
+        stale: await one(`SELECT COUNT(*) n FROM quiz_maker_questions WHERE status!='retired' AND next_review_at IS NOT NULL AND next_review_at < datetime('now','-7 day')`),
+      }
+    }
+    if (want.has('dueHistogram')) {
+      // 7 日到期热力（mistake-analyzer getForgetHeatmap 原查询 verbatim 迁入）
+      out.dueHistogram = await q1(
+        `SELECT date(next_review_at) AS day, COUNT(*) AS dueCount,
+                SUM(CASE WHEN EXISTS (SELECT 1 FROM quiz_maker_question_attempts qa WHERE qa.question_id = q.id AND qa.correct = 0) THEN 1 ELSE 0 END) AS wrongCount
+         FROM quiz_maker_questions q
+         WHERE status = 'confirmed' AND next_review_at IS NOT NULL
+           AND next_review_at <= date('now', '+7 days')
+         GROUP BY day ORDER BY day`
+      )
+    }
+    if (want.has('wrongAttempts')) {
+      // 错题作答流水（mistake-analyzer 原查询 verbatim 迁入，JOIN 版为另一查询的超集）
+      out.wrongAttempts = await q1(
+        `SELECT qa.question_id AS questionId, qa.reaction_ms AS reactionMs, qa.answered_at AS answeredAt,
+                q.knowledge_point_id AS knowledgePointId, q.status
+         FROM quiz_maker_question_attempts qa JOIN quiz_maker_questions q ON q.id = qa.question_id
+         WHERE qa.correct = 0 ORDER BY qa.answered_at DESC LIMIT ${clamp(a.wrongLimit, 1, 200, 50)}`
+      )
+    }
+    if (want.has('attempts')) {
+      // 作答快照行（listening-drill 听写错词回放原查询 verbatim 迁入；documentIds 必填防全表）
+      const ids = Array.isArray(a.documentIds) ? a.documentIds.map(String).filter(Boolean).slice(0, 200) : []
+      out.attempts = ids.length === 0 ? [] : await q1(
+        `SELECT document_id AS docId, question_snapshot AS snap, correct, response_text AS response
+         FROM quiz_maker_practice_attempts WHERE question_type = ? AND document_id IN (${ids.map(() => '?').join(',')}) ORDER BY rowid`,
+        [String(a.type || ''), ...ids]
+      )
+    }
+    if (want.has('clearedCount')) {
+      // 累计清偿文档数（study-analytics loadClearedCount 原查询 verbatim 迁入：
+      // 全表去重口径——同一文档跨天多次清偿只计一次）
+      const rows = await q1(`SELECT COUNT(DISTINCT document_id) AS n FROM quiz_maker_practice_attempts WHERE was_due = 1`)
+      out.clearedCount = Number(rows[0]?.n) || 0
+    }
+    if (want.has('docMistakes')) {
+      // 文档错题回看（study-analytics pageDocMistakes 原查询 verbatim 迁入；
+      // documentId 必填，自包含快照不依赖题库）
+      const docId = String(a.documentId || '')
+      out.docMistakes = docId ? await q1(
+        `SELECT question_snapshot AS questionSnapshot, answered_at AS answeredAt
+         FROM quiz_maker_practice_attempts WHERE document_id = ? AND correct = 0
+         ORDER BY answered_at DESC LIMIT 20`,
+        [docId]
+      ) : []
+    }
+    if (want.has('gateStats')) {
+      // 停采闸 30 天窗统计（question-radar gateStats 原查询 verbatim 迁入）
+      out.gateStats = await q1(
+        `SELECT COALESCE(NULLIF(q.generator,''),'未署名') AS generator, f.kind, COUNT(*) AS n
+         FROM quiz_maker_question_feedback f JOIN quiz_maker_questions q ON q.id = f.question_id
+         WHERE f.created_at >= datetime('now','-30 day') AND q.status != 'retired'
+         GROUP BY COALESCE(NULLIF(q.generator,''),'未署名'), f.kind`
+      )
+    }
+    if (want.has('uncoveredKps')) {
+      // 未覆盖知识点（question-radar 选源原查询 verbatim 迁入：无题 KP 升序）
+      out.uncoveredKps = await q1(
+        `SELECT kp.id, kp.title, kp.document_id AS documentId
+         FROM knowledge_points kp
+         LEFT JOIN quiz_maker_questions q ON q.knowledge_point_id = kp.id
+         WHERE q.id IS NULL
+         ORDER BY kp.created_at LIMIT 60`
+      )
+    }
+    if (want.has('weakKps')) {
+      // 30 天薄弱知识点（question-radar 选源原查询 verbatim 迁入：作答事实源 practice_attempts 快照关联）
+      out.weakKps = await q1(
+        `SELECT DISTINCT kp.id, kp.title, kp.document_id AS documentId
+         FROM knowledge_points kp
+         JOIN quiz_maker_questions q ON q.knowledge_point_id = kp.id
+         JOIN quiz_maker_practice_attempts a ON json_extract(a.question_snapshot, '$.id') = q.id
+         WHERE q.status != 'retired'
+           AND a.answered_at >= datetime('now', '-30 day')
+         GROUP BY kp.id
+         HAVING COUNT(a.id) >= 2 AND SUM(CASE WHEN a.correct = 1 THEN 1 ELSE 0 END) * 100 < COUNT(a.id) * 60
+         ORDER BY kp.created_at LIMIT 60`
+      )
+    }
+    if (want.has('effectRows')) {
+      // 30 天效果分析行（question-radar radar-effect 原查询 verbatim 迁入）
+      out.effectRows = await q1(
+        `SELECT kp.id AS kpid, COALESCE(NULLIF(q.generator,''),'未署名') AS gen, a.correct, a.answered_at FROM knowledge_points kp JOIN quiz_maker_questions q ON q.knowledge_point_id=kp.id JOIN quiz_maker_practice_attempts a ON json_extract(a.question_snapshot,'$.id')=q.id WHERE q.status!='retired' AND a.answered_at>=datetime('now','-30 day') ORDER BY a.answered_at`
+      )
+    }
+    if (want.has('weakDomains')) {
+      // 30 天薄弱域分布（question-radar 报告原查询 verbatim 迁入）
+      out.weakDomains = await q1(
+        `SELECT COALESCE(NULLIF(ts.domain,''),'(未标引)') AS domain, COUNT(*) AS weakKps FROM (SELECT kp.id, kp.document_id FROM knowledge_points kp JOIN quiz_maker_questions q ON q.knowledge_point_id=kp.id JOIN quiz_maker_practice_attempts a ON json_extract(a.question_snapshot,'$.id')=q.id WHERE q.status!='retired' AND a.answered_at>=datetime('now','-30 day') GROUP BY kp.id HAVING COUNT(a.id)>=2 AND SUM(CASE WHEN a.correct=1 THEN 1 ELSE 0 END)*100<COUNT(a.id)*60) w LEFT JOIN taxonomy_semantics ts ON ts.doc_id=w.document_id GROUP BY COALESCE(NULLIF(ts.domain,''),'(未标引)') ORDER BY weakKps DESC LIMIT 6`
+      )
+    }
+    if (want.has('kpQuestionCount')) {
+      // KP 在库题数回查（question-radar 报告原查询 verbatim 迁入；kpIds 必填防全表）
+      const kpIds = Array.isArray(a.kpIds) ? a.kpIds.map(String).filter(Boolean).slice(0, 500) : []
+      out.kpQuestionCount = kpIds.length === 0 ? [] : await q1(
+        `SELECT COUNT(DISTINCT knowledge_point_id) AS n FROM quiz_maker_questions WHERE status!='retired' AND knowledge_point_id IN (${kpIds.map(() => '?').join(',')})`,
+        kpIds
+      )
+    }
+    if (want.has('retentionSeries')) {
+      // 复习分析 B3-1（pro-narrative-v2 P1）：到期作答周桶正确率 + 文档级 SM-2 状态与保持预估曲线
+      try { out.retentionSeries = (await caliber.getRetentionSeries(moduleCtx.query, { weeks: a.weeks })) || null } catch { out.retentionSeries = null }
+    }
+    if (want.has('masteryByKp')) {
+      // KP 掌握度（concept 表不在插件读面白名单，v1 落 KP 级——与 weakKps 同维；只读聚合不回写调度）
+      try { out.masteryByKp = (await caliber.getMasteryByKp(moduleCtx.query, { limit: a.masteryLimit })) || [] } catch { out.masteryByKp = [] }
+    }
+    if (want.has('domainHeatmap')) {
+      // 域热力行（weakDomains 同源 join 链补 attempts/accuracy 维）
+      try { out.domainHeatmap = (await caliber.getDomainHeatmap(moduleCtx.query, { days: a.heatDays })) || [] } catch { out.domainHeatmap = [] }
+    }
+    if (want.has('plannerPlan')) {
+      // 考前规划器：到期地平线 + 容量（debtStats 同源）+ examDate（调用方经 rhythm-config 资产门取，单源禁双份）
+      try {
+        const horizon = (await caliber.getDueHorizon(moduleCtx.query, a.plannerHorizon)) || []
+        const debt = (await caliber.getPracticeDebtStats(moduleCtx.query)) || {}
+        out.plannerPlan = caliber.buildPlannerPlan({ examDate: a.examDate, dueByDay: horizon, dailyAvg: debt.dailyAvg })
+      } catch { out.plannerPlan = { active: false } }
+    }
+    return out
+  },
+  /**
+   * 画像贡献资产（画像迁移计划 D6 反转 P2 贡献机制 v1）：内核 LearnerProfileService 经资产
+   * 目录识别本资产（manifest profileContribution: true）并聚合——替代内核经视图别名直读练习表。
+   * 契约冻结：输出 Array<{ domain, attempts7d, attempts30d, weakCount }>，domain 对齐
+   * taxonomy_semantics.domain（未标引落「未分类」）；口径与原内核直读 SQL 逐字同源（表名自店），
+   * 供方查询失败=输出空数组（贡献分量如实归零，不裸抛——内核侧按契约行卫校验）。
+   */
+  async getProfileContribution() {
+    const now = new Date()
+    const d7 = new Date(now.getTime() - 7 * 86400000).toISOString()
+    const d30 = new Date(now.getTime() - 30 * 86400000).toISOString()
+    const DOM = `COALESCE(NULLIF(ts.domain, ''), '未分类')`
+    const q1 = async (sql, params) => { try { return ((await moduleCtx.query(sql, params)) || []) } catch { return [] } }
+    const attemptRows = await q1(
+      `SELECT ${DOM} AS domain,
+              SUM(CASE WHEN pa.answered_at >= ? THEN 1 ELSE 0 END) AS attempts7d,
+              COUNT(*) AS attempts30d
+       FROM quiz_maker_practice_attempts pa
+       JOIN documents d ON d.id = pa.document_id
+       LEFT JOIN taxonomy_semantics ts ON ts.doc_id = d.id
+       WHERE pa.answered_at >= ?
+       GROUP BY domain`, [d7, d30])
+    const weakRows = await q1(
+      `SELECT domain, COUNT(*) AS weakCount
+       FROM (
+         SELECT kp.id, ${DOM} AS domain
+         FROM knowledge_points kp
+         JOIN quiz_maker_questions q ON q.knowledge_point_id = kp.id
+         LEFT JOIN quiz_maker_question_attempts a ON a.question_id = q.id
+         JOIN documents d ON d.id = kp.document_id
+         LEFT JOIN taxonomy_semantics ts ON ts.doc_id = d.id
+         WHERE q.status != 'retired'
+         GROUP BY kp.id
+         HAVING COUNT(a.id) >= 2 AND SUM(CASE WHEN a.correct = 1 THEN 1 ELSE 0 END) * 100 < COUNT(a.id) * 60
+       ) GROUP BY domain`)
+    const weakBy = new Map(weakRows.map((r) => [String(r.domain), Number(r.weakCount) || 0]))
+    const attBy = new Map(attemptRows.map((r) => [String(r.domain), r]))
+    const domains = new Set([...attBy.keys(), ...weakBy.keys()])
+    return [...domains].map((domain) => {
+      const att = attBy.get(domain) || {}
+      return {
+        domain,
+        attempts7d: Number(att.attempts7d) || 0,
+        attempts30d: Number(att.attempts30d) || 0,
+        weakCount: weakBy.get(domain) || 0,
+      }
+    })
+  },
+
   description: '内化阶段：出题官角色（LLM 深度出题，接地校验+盲答验证双闸门）+ 确定性即时挖空题，入库立即开练（作答双轨记账）+ 题库页（题库浏览/复习/导出/恢复）',
 
   activate(context) {
     moduleCtx = context
+    // 学习闭环工具注册（迁移自 baize 内核）：api 注入同插件引擎直调（同插件自重入禁经互调通道——ADR-201 §4）
+    registerPracticeTools(context, { practiceInstant, selectExpansionTargets })
+    registerLearningTools(context)
+    registerLearningCoachTools(context)
     // generate_quiz（LLM 深度出题入口，2026-09-18 v2）：按 H2 分节喂料（替代原"前 3000 字符"截断），
     // 携带知识点锚点与薄弱点信号（个性化：哪里弱出哪里），并指引主 agent 委派「出题官」专家出题。
     // 出题官经 agent.preset 贡献声明（本插件 manifest），透明默认生效——用户无需选择角色。
@@ -1178,9 +1727,9 @@ module.exports = {
             `SELECT q.id, q.question, q.document_id AS documentId, d.title AS documentTitle,
                     COUNT(a.id) AS attempts,
                     COALESCE(SUM(CASE WHEN a.correct = 1 THEN 1 ELSE 0 END), 0) AS correctCount
-             FROM questions q
+             FROM quiz_maker_questions q
              LEFT JOIN documents d ON d.id = q.document_id
-             LEFT JOIN question_attempts a ON a.question_id = q.id
+             LEFT JOIN quiz_maker_question_attempts a ON a.question_id = q.id
              WHERE q.status != 'retired' AND d.id IN (${documents.map(() => '?').join(',')})
              GROUP BY q.id HAVING attempts >= 2 AND correctCount * 100 < attempts * 60
              LIMIT 5`,
@@ -1216,6 +1765,7 @@ module.exports = {
   deactivate() {},
 
   practiceInstant,
+  authorQuestionsForDoc,
 
   pageQuestionBank,
   locateSourceDoc,
@@ -1230,6 +1780,10 @@ module.exports = {
   exportBankJson,
   exportBankAnki,
   importBank,
+  confirmBankImport,
+  downloadImportTemplate,
+  exportBankChoose,
+  pageAgentSupplement,
   pageGeneratePrompt,
   selectExpansionTargets,
   pageExpandHandoff,
