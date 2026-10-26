@@ -1,7 +1,7 @@
 {
   "id": "quiz-maker",
   "name": "练习",
-  "version": "0.42.0",
+  "version": "0.43.0",
   "description": "学习闭环（做题与复习）：内核级 9 工具（出题双写/补题/做题会话/复习调度/判分回流/学习统计/学习教练）+ 深度出题官 + 练习页。停用即学习工具面整体消失。",
   "entry": "index.js",
   "permissions": [
@@ -138,7 +138,7 @@
       {
         "id": "stats",
         "title": "学习统计聚合",
-        "description": "学习口径单一实现（22 节化取数：summary/dueBreakdown/weakDocs/streak/docStats/attemptsByDay/firstTaggedDay/dueFroms/docAccuracy/byGenerator/bankQuality/dueHistogram/wrongAttempts/attempts/clearedCount/docMistakes/gateStats/uncoveredKps/weakKps/effectRows/weakDomains/kpQuestionCount，args.sections 声明所需）",
+        "description": "学习口径单一实现（节化取数：summary/dueBreakdown/dueQueue/relearnQueue/debtStats/weakDocs/streak/docStats/attemptsByDay/firstTaggedDay/dueFroms/docAccuracy/byGenerator/bankQuality/dueHistogram/wrongAttempts/attempts/clearedCount/docMistakes/gateStats/uncoveredKps/weakKps/effectRows/weakDomains/kpQuestionCount/retentionSeries/masteryByKp/conceptMemory/mistakeAttribution/domainHeatmap/plannerPlan，args.sections 声明所需）",
         "schema": "对象: { generatedAt, <各节>, 节失败置空 }",
         "method": "getStudyStats",
         "queryParams": [

@@ -1335,7 +1335,7 @@ async function practiceQuestion(questionId) {
 module.exports = {
   id: PLUGIN_ID,
   name: '练习',
-  version: '0.42.0',
+  version: '0.43.0',
 
   // ---- 数据资产查询面（capability-asset-layering T6 叙事归属：内核底座经本插件目录暴露）----
   async listQuestions(args) {
@@ -1395,7 +1395,7 @@ module.exports = {
    */
   async getStudyStats(args = {}) {
     const a = args && typeof args === 'object' ? args : {}
-    const ALL = ['summary', 'dueBreakdown', 'dueQueue', 'debtStats', 'weakDocs', 'streak', 'docStats', 'attemptsByDay', 'firstTaggedDay', 'dueFroms', 'docAccuracy', 'byGenerator', 'bankQuality', 'dueHistogram', 'wrongAttempts', 'attempts', 'clearedCount', 'docMistakes', 'gateStats', 'uncoveredKps', 'weakKps', 'effectRows', 'weakDomains', 'kpQuestionCount', 'retentionSeries', 'masteryByKp', 'domainHeatmap', 'plannerPlan']
+    const ALL = ['summary', 'dueBreakdown', 'dueQueue', 'relearnQueue', 'debtStats', 'weakDocs', 'streak', 'docStats', 'attemptsByDay', 'firstTaggedDay', 'dueFroms', 'docAccuracy', 'byGenerator', 'bankQuality', 'dueHistogram', 'wrongAttempts', 'attempts', 'clearedCount', 'docMistakes', 'gateStats', 'uncoveredKps', 'weakKps', 'effectRows', 'weakDomains', 'kpQuestionCount', 'retentionSeries', 'masteryByKp', 'domainHeatmap', 'plannerPlan', 'conceptMemory', 'mistakeAttribution']
     const sections = Array.isArray(a.sections) && a.sections.length ? a.sections : ['summary', 'dueBreakdown', 'streak']
     const want = new Set(sections.filter((k) => ALL.includes(k)))
     const out = { generatedAt: new Date().toISOString() }
@@ -1411,6 +1411,10 @@ module.exports = {
     if (want.has('dueQueue')) {
       // 今日集取数（study-coach 决策内核消费）：到期文档队列（id/标题/到期时刻/正确率，到期升序）
       try { out.dueQueue = (await caliber.getDueQueue(moduleCtx.query, clamp(a.limit, 1, 200, 50))) || [] } catch { out.dueQueue = [] }
+    }
+    if (want.has('relearnQueue')) {
+      // 重学清单队列（B2 债→雾，study-coach 雾区消费）：>14 天未清偿文档，最久未清偿在前
+      try { out.relearnQueue = (await caliber.getRelearnQueue(moduleCtx.query, clamp(a.limit, 1, 100, 20))) || [] } catch { out.relearnQueue = [] }
     }
     if (want.has('debtStats')) {
       // 清偿保险丝容量口径（rhythm-config 资产化 2026-10-14：近 7 天作答行数+日均，供 study-reminder 合成保险丝）
@@ -1595,8 +1599,17 @@ module.exports = {
       try { out.retentionSeries = (await caliber.getRetentionSeries(moduleCtx.query, { weeks: a.weeks })) || null } catch { out.retentionSeries = null }
     }
     if (want.has('masteryByKp')) {
-      // KP 掌握度（concept 表不在插件读面白名单，v1 落 KP 级——与 weakKps 同维；只读聚合不回写调度）
+      // KP 掌握度（v1 落 KP 级——B3 起概念级聚合见 conceptMemory 节，D4 派生读模型）
       try { out.masteryByKp = (await caliber.getMasteryByKp(moduleCtx.query, { limit: a.masteryLimit })) || [] } catch { out.masteryByKp = [] }
+    }
+    if (want.has('conceptMemory')) {
+      // 概念级记忆聚合（B3，D4 拍板=派生读模型零迁移）：快照×kp_concepts 直聚
+      // 正确率/作答数/最近练习/SM-2 均值，薄弱概念在前（study-coach Top3 消费）
+      try { out.conceptMemory = (await caliber.getConceptMemory(moduleCtx.query, { limit: a.conceptLimit })) || [] } catch { out.conceptMemory = [] }
+    }
+    if (want.has('mistakeAttribution')) {
+      // 文档维度错因归因（B5 归因改写策略取数节）：三分类表驱动，dominant 供 today-plan 改写排序
+      try { out.mistakeAttribution = (await caliber.getMistakeAttribution(moduleCtx.query, { days: a.attributionDays })) || [] } catch { out.mistakeAttribution = [] }
     }
     if (want.has('domainHeatmap')) {
       // 域热力行（weakDomains 同源 join 链补 attempts/accuracy 维）
